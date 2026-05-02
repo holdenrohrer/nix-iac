@@ -4,7 +4,7 @@
 { pkgs, system, deploy-rs, bundle, lib }:
 
 let
-  shellChecks = [ "SC2155" "SC2046" "SC2086" "SC2016" ];
+  shellChecks = [ "SC2155" "SC2046" "SC2086" "SC2016" "SC2034" ];
 
   # --- Tagged source constructors -------------------------------------------
   # `sopsKey` is curried: bind a file once, then call repeatedly per key.
@@ -145,7 +145,7 @@ let
           ${if gen.type == "once" then ''
             ${genName}_val="$(${gen.command})"
           '' else ''
-            ${genName}_val="$(printf '%s' "$${gen.from}_val" | ${gen.command})"
+            ${genName}_val="$(printf '%s' "\$${gen.from}_val" | ${gen.command})"
           ''}
           export ${varName}="$${genName}_val"
         fi

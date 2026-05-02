@@ -40,7 +40,7 @@ let
     ( cd "$tf_dir" && tofu init -input=false -reconfigure >/dev/null )
 
     # Decrypt operator sops file (asks GPG agent on first run per session)
-    sops -d "${toString sopsFile}" > "$tmp/plain.yaml"
+    sops --config /dev/null -d "${toString sopsFile}" > "$tmp/plain.yaml"
     chmod 600 "$tmp/plain.yaml"
   '';
 
@@ -113,7 +113,7 @@ let
           )
         }}' > "$tmp/server-plain.json"
       yq -P "$tmp/server-plain.json" > "$tmp/server-plain.yaml"
-      sops --encrypt --input-type yaml --output-type yaml --age "$age_pub" "$tmp/server-plain.yaml" \
+      sops --config /dev/null --encrypt --input-type yaml --output-type yaml --age "$age_pub" "$tmp/server-plain.yaml" \
         > "$tmp/server-secrets.yaml"
 
       # Probe and branch
@@ -188,8 +188,8 @@ let
       name = "sops-edit";
       runtimeInputs = [ pkgs.sops ];
       text = ''
-        # Single-recipient sops (operator GPG only). Pass through.
-        exec sops "$@" "${toString sopsFile}"
+        # No .sops.yaml; recipients live in the file's metadata header.
+        exec sops --config /dev/null "$@" "${toString sopsFile}"
       '';
     };
 

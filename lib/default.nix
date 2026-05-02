@@ -116,8 +116,8 @@ let
         ) (lib.attrsToList serverSecretsFromTfState)} \
         '{${
           lib.concatStringsSep ", " (
-            (map (k: "${k}: $${k}") serverSecrets) ++
-            (map (e: "${e.name}: $${e.name}") (lib.attrsToList serverSecretsFromTfState))
+            (map (k: "${k}: \$${k}") serverSecrets) ++
+            (map (e: "${e.name}: \$${e.name}") (lib.attrsToList serverSecretsFromTfState))
           )
         }}' > "$tmp/server-plain.json"
       yq -P "$tmp/server-plain.json" > "$tmp/server-plain.yaml"

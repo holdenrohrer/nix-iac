@@ -169,22 +169,32 @@ deployHost root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \
   writeFile        (extras </> "etc/ssh/authorized_keys.d/root") (sshPub <> "\n")
   setFileMode      (extras </> "etc/ssh/authorized_keys.d/root") 0o600
 
-  alreadyNixOS <- Probe.probeNixos ip sshKey
-  when alreadyNixOS $ do
-    run "scp"
-      [ "-i", sshKey
-      , "-o", "StrictHostKeyChecking=accept-new"
-      , blobOut
-      , "root@" <> ip <> ":" <> hServerSecretsPath h <> ".new"
-      ]
-    run "ssh"
-      [ "-i", sshKey
-      , "-o", "StrictHostKeyChecking=accept-new"
-      , "root@" <> ip
-      , "install -m 600 " <> hServerSecretsPath h <> ".new " <> hServerSecretsPath h
-      ]
+  -- Three-way probe: only nixos-anywhere when we *positively confirm*
+  -- the host is not yet NixOS. Any ssh failure aborts; we never
+  -- silently treat an unreachable host as "needs bootstrap".
+  probe <- Probe.probeNixos ip sshKey
+  case probe of
+    Probe.SshFailed n ->
+      die ("probe: ssh to " <> ip <> " failed (exit " <> show n
+           <> "); refusing to bootstrap a host we can't reach")
+    Probe.IsNotNixOS -> do
+      IO.hPutStrLn IO.stderr ("==> " <> hName h <> ": not NixOS, bootstrapping via nixos-anywhere")
+      Nixify.nixify (hName h) flakeRef ip sshKey (Just extras)
+    Probe.IsNixOS -> do
+      IO.hPutStrLn IO.stderr ("==> " <> hName h <> ": already NixOS, shipping new sops blob")
+      run "scp"
+        [ "-i", sshKey
+        , "-o", "StrictHostKeyChecking=accept-new"
+        , blobOut
+        , "root@" <> ip <> ":" <> hServerSecretsPath h <> ".new"
+        ]
+      run "ssh"
+        [ "-i", sshKey
+        , "-o", "StrictHostKeyChecking=accept-new"
+        , "root@" <> ip
+        , "install -m 600 " <> hServerSecretsPath h <> ".new " <> hServerSecretsPath h
+        ]
 
-  Nixify.nixify (hName h) flakeRef ip sshKey (Just extras)
   Deploy.deployWithRollback flakeRef (hName h) ip sshKey
   Reboot.rebootIfBootCritical ip sshKey
 

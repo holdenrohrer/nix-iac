@@ -74,19 +74,23 @@ let
       use = key: tfStateOutput "${name}_${key}";
 
       # Terranix module: variable + terraform_data + outputs for each generator.
-      terranixModule = {
-        variable = builtins.mapAttrs (n: g: {
+      # Variables and outputs are prefixed with the host name to avoid collisions
+      # across hosts in a single-flake-multiple-hosts config.
+      terranixModule = let
+        prefix = "${name}_";
+      in {
+        variable = lib.mapAttrs' (n: g: lib.nameValuePair "${prefix}${n}" {
           type = "string";
           sensitive = g.sensitive;
           default = "ignored";
         }) allGenerators;
 
         resource.terraform_data."${name}_keys" = {
-          input = builtins.mapAttrs (n: _: "\${var.${name}_${n}}") allGenerators;
+          input = lib.mapAttrs (n: _: "\${var.${prefix}${n}}") allGenerators;
           lifecycle = { ignore_changes = [ "input" ]; };
         };
 
-        output = builtins.mapAttrs (n: g: {
+        output = lib.mapAttrs' (n: g: lib.nameValuePair "${prefix}${n}" {
           value = "\${terraform_data.${name}_keys.output.${n}}";
           sensitive = g.sensitive;
         }) allGenerators;

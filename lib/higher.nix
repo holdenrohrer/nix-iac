@@ -12,16 +12,21 @@ let
   shellChecks = [ "SC2155" "SC2046" "SC2086" "SC2016" ];
 
   # --- Tagged source constructors -------------------------------------------
-  sopsKey       = key:  { kind = "sops";     payload = key; };
-  tfStateOutput = name: { kind = "tfstate";  payload = name; };
-  literal       = val:  { kind = "literal";  payload = val; };
-  cmd           = c:    { kind = "cmd";      payload = c; };
+  # `sopsKey` is curried: bind a file once, then call repeatedly per key.
+  #   infra_sops = sopsKey ./secrets/infra.yaml;
+  #   serverSecrets.github_token = infra_sops "github_token";
+  sopsKey       = file: key: { kind = "sops"; payload = { inherit file key; }; };
+  tfStateOutput = name:       { kind = "tfstate"; payload = name; };
+  literal       = val:        { kind = "literal"; payload = val; };
+  cmd           = c:          { kind = "cmd"; payload = c; };
 
   # Render a tagged source as a bash expression that produces the value.
-  # Assumes get_sops / get_tf bash functions are in scope.
+  # `get_tf` is the only bash function assumed to be in scope; sops calls are
+  # emitted directly with the per-source file path.
   renderSource = src:
-    if      src.kind == "sops"     then ''$(get_sops "${src.payload}")''
-    else if src.kind == "tfstate"  then ''$(get_tf   "${src.payload}")''
+    if      src.kind == "sops"
+      then ''$(sops --config /dev/null -d --extract "[\"${src.payload.key}\"]" "${toString src.payload.file}")''
+    else if src.kind == "tfstate"  then ''$(get_tf "${src.payload}")''
     else if src.kind == "literal"  then src.payload
     else if src.kind == "cmd"      then "$(${src.payload})"
     else throw "renderSource: unknown kind '${src.kind}'";
@@ -99,8 +104,7 @@ let
   mkInfraApp = {
     flake,                   # consumer's `self` (a flake)
     terranixConfig,          # derivation: the rendered config.tf.json
-    sopsFile,                # path to operator sops file
-    deployEnv ? {},          # { ENV_VAR = sopsKey "..."; ... }
+    deployEnv ? {},          # { ENV_VAR = sopsKey file "..."; ... }
     hosts,                   # [ (mkHost {...}) ... ]
     stateDir ? ".tf-state",
   }:
@@ -185,8 +189,7 @@ let
       tf_dir="$root/${stateDir}"
       tmp="$(mktemp -d)"; chmod 700 "$tmp"; trap 'rm -rf "$tmp"' EXIT
 
-      get_sops() { sops --config /dev/null -d --extract "[\"$1\"]" "${toString sopsFile}"; }
-      get_tf()   { tofu -chdir="$tf_dir" output -raw "$1"; }
+      get_tf() { tofu -chdir="$tf_dir" output -raw "$1"; }
 
       ${exportEnv deployEnv}
 

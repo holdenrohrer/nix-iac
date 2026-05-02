@@ -1,0 +1,29 @@
+cabal-version:      3.0
+name:               nix-iac
+version:            0.1.0.0
+synopsis:           Constrained, idempotent IaC orchestration primitives
+license:            BSD-3-Clause
+build-type:         Simple
+
+common opts
+  default-language: GHC2021
+  ghc-options:      -Wall -Wcompat -Wunused-packages -Werror=missing-fields
+  build-depends:
+      base                 ^>= 4.20
+    , text
+    , bytestring
+    , process
+    , aeson
+    , directory
+    , filepath
+
+library
+  import:           opts
+  hs-source-dirs:   src
+  exposed-modules:  NixIac
+
+executable infra
+  import:           opts
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  build-depends:    nix-iac

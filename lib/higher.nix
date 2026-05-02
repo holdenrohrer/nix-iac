@@ -144,8 +144,9 @@ let
         ip="$(get_tf ${host.outputs.ip})"
         age_pub="$(get_tf ${host.outputs.agePub})"
         ssh_pub="$(get_tf ${host.outputs.sshPub})"
-        get_tf ${host.outputs.sshPriv} > "$tmp/${host.name}.ssh.key"
-        get_tf ${host.outputs.agePriv} > "$tmp/${host.name}.age.key"
+        # Ensure a trailing newline; libcrypto rejects SSH keys without one
+        { get_tf ${host.outputs.sshPriv}; printf '\n'; } > "$tmp/${host.name}.ssh.key"
+        { get_tf ${host.outputs.agePriv}; printf '\n'; } > "$tmp/${host.name}.age.key"
         chmod 600 "$tmp/${host.name}.ssh.key" "$tmp/${host.name}.age.key"
 
         cat > "$tmp/${host.name}.blob.yaml" <<EOF

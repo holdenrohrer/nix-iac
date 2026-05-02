@@ -1,7 +1,7 @@
 cabal-version:      3.0
 name:               nix-iac
-version:            0.1.0.0
-synopsis:           Constrained, idempotent IaC orchestration primitives
+version:            0.2.0.0
+synopsis:           Typed-handle DSL backend for Nix-native infra orchestration
 license:            BSD-3-Clause
 build-type:         Simple
 
@@ -10,10 +10,8 @@ common opts
   ghc-options:      -Wall -Wcompat -Wunused-packages -Werror=missing-fields
   build-depends:
       base                 ^>= 4.20
-    , text
     , bytestring
     , process
-    , aeson
     , directory
     , filepath
     , containers
@@ -24,19 +22,11 @@ library
   import:           opts
   hs-source-dirs:   src
   exposed-modules:
-      NixIac
-    , NixIac.Apply
-    , NixIac.Config
+      NixIac.Orchestrator
+    , NixIac.Plan
     , NixIac.Deploy
     , NixIac.Nixify
     , NixIac.Probe
     , NixIac.Reboot
     , NixIac.Run
     , NixIac.Sops
-    , NixIac.TfState
-
-executable infra
-  import:           opts
-  hs-source-dirs:   app
-  main-is:          Main.hs
-  build-depends:    nix-iac

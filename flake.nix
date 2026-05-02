@@ -1,9 +1,10 @@
 {
-  description = "NixOS deploy orchestration: Haskell binary + Nix-side terranix helpers";
+  description = "nix-iac: typed-handle DSL for Nix-native infra orchestration";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url     = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
+    terranix.url    = "github:terranix/terranix";
     nixos-anywhere = {
       url = "github:nix-community/nixos-anywhere";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -14,46 +15,49 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, nixos-anywhere, deploy-rs }:
+  outputs = { self, nixpkgs, flake-utils, terranix, nixos-anywhere, deploy-rs }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        infraUnwrapped = pkgs.haskellPackages.callCabal2nix "nix-iac" ./. {};
+        # The Haskell library every per-consumer binary links against.
+        nixIacLib = pkgs.haskellPackages.callCabal2nix "nix-iac" ./. {};
 
-        runtimeTools = [
-          pkgs.opentofu pkgs.sops pkgs.age pkgs.openssh
-          pkgs.curl pkgs.jq pkgs.git pkgs.coreutils pkgs.gnused
-          nixos-anywhere.packages.${system}.default
-          deploy-rs.packages.${system}.default
-        ];
-
-        infra = pkgs.runCommand "infra" {
-          nativeBuildInputs = [ pkgs.makeWrapper ];
-        } ''
-          mkdir -p $out/bin
-          makeWrapper ${infraUnwrapped}/bin/infra $out/bin/infra \
-            --prefix PATH : ${pkgs.lib.makeBinPath runtimeTools}
-        '';
-
-        higherOrder = import ./lib/higher.nix {
-          inherit pkgs system deploy-rs infra;
+        iac = import ./lib/iac.nix {
+          inherit pkgs system deploy-rs nixos-anywhere terranix nixIacLib;
           lib = pkgs.lib;
         };
-      in {
-        packages.default = infra;
-        packages.infra   = infra;
-        lib              = higherOrder;
 
-        apps.infra = {
-          type = "app";
-          program = "${infra}/bin/infra";
+        # In-tree fixture: synthetic consumer that exercises every DSL
+        # primitive against the local terraform backend, no creds needed.
+        fixture = import ./tests/fixture { inherit iac pkgs system; flake = self; };
+      in {
+        lib = iac;
+
+        packages = {
+          nix-iac-lib = nixIacLib;
+        };
+
+        apps = {
+          fixture-infra = fixture.app;
+        };
+
+        checks = {
+          # Build the fixture's per-consumer binary. Proves the whole
+          # pipeline (DSL -> walk Sources -> generate Main.hs -> callCabal2nix)
+          # is coherent end-to-end.
+          fixture-infra-builds =
+            pkgs.runCommand "fixture-infra-builds" {} ''
+              ls -l ${fixture.app.program} > $out
+            '';
         };
 
         devShells.default = pkgs.mkShell {
-          buildInputs = [ pkgs.cabal-install pkgs.haskellPackages.haskell-language-server ]
-            ++ infraUnwrapped.env.nativeBuildInputs;
-          inputsFrom = [ infraUnwrapped.env ];
+          buildInputs = [
+            pkgs.cabal-install
+            pkgs.haskellPackages.haskell-language-server
+          ] ++ nixIacLib.env.nativeBuildInputs;
+          inputsFrom = [ nixIacLib.env ];
         };
       });
 }

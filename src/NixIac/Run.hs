@@ -1,5 +1,6 @@
 -- | Thin wrappers around `process`: exec a command and capture its trimmed
--- stdout, or run-or-die.
+-- stdout, or run-or-die. Assumes a UTF-8 locale (mkInfraApp's wrapper
+-- pins LANG=C.UTF-8 so we can rely on it).
 module NixIac.Run
   ( capture
   , captureExit
@@ -12,14 +13,14 @@ import           System.Exit (ExitCode (..), exitWith)
 import qualified System.IO  as IO
 import           System.Process
 
--- | Run a command, return (exit code, trimmed stdout).
+-- | Run a command, return (exit code, trimmed stdout). Stderr discarded.
 captureExit :: FilePath -> [String] -> IO (ExitCode, String)
 captureExit cmd args = do
   (ec, out, _err) <- readCreateProcessWithExitCode (proc cmd args) ""
   pure (ec, dropWhileEnd isSpace out)
 
--- | Run a command; on success return trimmed stdout. On failure exit with the
--- subprocess' exit code, propagating its stderr to ours.
+-- | Run a command; on success return trimmed stdout. On failure exit
+-- with the subprocess' exit code, propagating its stderr to ours.
 capture :: FilePath -> [String] -> IO String
 capture cmd args = do
   (ec, out, err) <- readCreateProcessWithExitCode (proc cmd args) ""

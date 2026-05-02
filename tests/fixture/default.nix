@@ -61,6 +61,29 @@ let
     };
     stateDir = ".tf-fixture";
   };
+
+  # Tofu-only variant: empty hosts (so the deploy phase is a no-op),
+  # no sops in deployEnv (so we don't need a real sops file). Exercises
+  # the tfstate apply path end-to-end against the local backend.
+  tofuOnlyPriv  = private.output "tofu_only_password" (iac.gen.once "printf 'static-pw-value'");
+  tofuOnlyDeriv = private.output "tofu_only_password_doubled"
+                    (iac.gen.derive' { from = tofuOnlyPriv; command = "tr -d '\\n' | sed 's/.*/&-derived/'"; });
+  tofuOnlyPub   = public.output "tofu_only_greeting" { value = "hi-from-public-state"; };
+
+  tofuOnlyApp = iac.mkInfraApp {
+    flake    = flake;
+    hosts    = [];
+    tfStates = [
+      { state = private; modules = []; }
+      { state = public;  modules = []; }
+    ];
+    deployEnv = {
+      EXAMPLE_LITERAL = iac.src.literal "literal-env-value";
+      EXAMPLE_CMD     = iac.src.cmd "printf cmd-env-value";
+    };
+    extraSources = [ tofuOnlyPriv tofuOnlyDeriv tofuOnlyPub ];
+    stateDir = ".tf-fixture-tofu-only";
+  };
 in {
-  inherit app;
+  inherit app tofuOnlyApp;
 }

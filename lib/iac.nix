@@ -341,7 +341,10 @@ let
 
   # ----------------------------------------------------------- mkInfraApp
 
-  mkInfraApp = { flake, hosts, tfStates, deployEnv ? {}, stateDir ? ".tf-state" }:
+  # `extraSources` is for declarations that should land in tfstate but
+  # aren't consumed by any host's serverSecrets or by deployEnv —
+  # typically outputs published for an external flake to read.
+  mkInfraApp = { flake, hosts, tfStates, deployEnv ? {}, stateDir ? ".tf-state", extraSources ? [] }:
     let
       flakeRef = "${flake}";
 
@@ -357,6 +360,7 @@ let
       reachable = sourceClosure (
            collectSources hosts
         ++ collectSources deployEnv
+        ++ extraSources
       );
 
       tfStateCfgs = map (perStateConfig reachable) tfStates;
@@ -399,7 +403,9 @@ let
       } ''
         mkdir -p $out/bin
         makeWrapper ${consumerPkg}/bin/infra $out/bin/infra \
-          --prefix PATH : ${pkgs.lib.makeBinPath runtimeTools}
+          --prefix PATH : ${pkgs.lib.makeBinPath runtimeTools} \
+          --set LANG C.UTF-8 \
+          --set LC_ALL C.UTF-8
       '';
     in {
       type = "app";

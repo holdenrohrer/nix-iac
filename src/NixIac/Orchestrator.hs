@@ -1,4 +1,5 @@
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LambdaCase         #-}
+{-# LANGUAGE OverloadedStrings  #-}
 -- | The top-level apply loop. Idempotent end-to-end: every step either
 -- no-ops (already-NixOS, generator already pinned) or makes additive
 -- forward progress.
@@ -7,23 +8,28 @@ module NixIac.Orchestrator
   , module NixIac.Plan
   ) where
 
-import           Control.Monad      (forM_, when)
+import qualified Data.Aeson                 as A
+import qualified Data.Aeson.Key             as AK
+import qualified Data.Aeson.KeyMap          as AKM
+import qualified Data.ByteString.Lazy.Char8 as L8
+import           Control.Monad              (forM_, when)
 import           Data.IORef
-import qualified Data.Map.Strict    as Map
+import qualified Data.Map.Strict            as Map
+import qualified Data.Text                  as T
 import           NixIac.Plan
-import qualified NixIac.Deploy      as Deploy
-import qualified NixIac.Nixify      as Nixify
-import qualified NixIac.Probe       as Probe
-import qualified NixIac.Reboot      as Reboot
-import           NixIac.Run         (capture, captureExit, die, run)
-import qualified NixIac.Sops        as Sops
-import           System.Directory   (copyFile, createDirectoryIfMissing)
-import           System.Environment (setEnv)
-import           System.Exit        (ExitCode (..))
-import           System.FilePath    ((</>))
-import qualified System.IO          as IO
-import           System.IO.Temp     (withSystemTempDirectory)
-import           System.Posix.Files (setFileMode)
+import qualified NixIac.Deploy              as Deploy
+import qualified NixIac.Nixify              as Nixify
+import qualified NixIac.Probe               as Probe
+import qualified NixIac.Reboot              as Reboot
+import           NixIac.Run                 (capture, captureExit, die, run)
+import qualified NixIac.Sops                as Sops
+import           System.Directory           (copyFile, createDirectoryIfMissing)
+import           System.Environment         (setEnv)
+import           System.Exit                (ExitCode (..))
+import           System.FilePath            ((</>))
+import qualified System.IO                  as IO
+import           System.IO.Temp             (withSystemTempDirectory)
+import           System.Posix.Files         (setFileMode)
 
 -- | Entry point. Drives every tfstate to convergence, then deploys every
 -- host. See module header for invariants.
@@ -65,11 +71,14 @@ applyState root s = do
   copyFile (tfsConfigFile s) (dir </> "config.tf.json")
   run "tofu" ["-chdir=" <> dir, "init", "-input=false", "-reconfigure"]
 
-  -- Generators: lookup table by output name + IORef cache. resolveInState
-  -- recursively materializes any same-state generator referenced by a
-  -- Derive — so the order of the forM_ below is irrelevant.
+  -- Read all already-pinned outputs from this state in one shot; tofu
+  -- output -json on an empty state returns "{}" with exit 0 — `-raw` per
+  -- key returns exit 0 with the warning text on stdout, which is unsafe
+  -- to interpret as the value.
+  pinned <- readPinnedOutputs dir
+
   let genMap = Map.fromList [ (gsOutputName gs, gsGenerator gs) | gs <- tfsGenerators s ]
-  cache <- newIORef (Map.empty :: Map.Map String String)
+  cache <- newIORef (pinned :: Map.Map String String)
   let resolveSrc :: Source -> IO String
       resolveSrc = \case
         Literal v -> pure v
@@ -84,7 +93,7 @@ applyState root s = do
           Just v  -> pure v
           Nothing -> do
             v <- case Map.lookup k genMap of
-              Just g  -> materializeGenerator dir resolveSrc k g
+              Just g  -> materializeGenerator resolveSrc g
               Nothing -> tofuOutAt dir k
             modifyIORef' cache (Map.insert k v)
             pure v
@@ -95,25 +104,36 @@ applyState root s = do
 
   run "tofu" ["-chdir=" <> dir, "apply", "-auto-approve", "-input=false"]
 
--- | Resolve-or-create a single generator's value. If tfstate already has
--- it, take that value verbatim and pass "ignored" to TF_VAR (the
--- terraform_data + ignore_changes lifecycle keeps it pinned). Otherwise
--- compute from spec.
+-- | One-shot read of every output already present in a tfstate. Empty
+-- state returns an empty map (not an error).
+readPinnedOutputs :: FilePath -> IO (Map.Map String String)
+readPinnedOutputs dir = do
+  (ec, jsonText) <- captureExit "tofu" ["-chdir=" <> dir, "output", "-json"]
+  case ec of
+    ExitFailure _ -> pure Map.empty
+    ExitSuccess   -> case A.eitherDecode (L8.pack jsonText) of
+      Left _              -> pure Map.empty
+      Right (A.Object km) -> pure $ Map.fromList
+        [ (AK.toString k, jsonAsString v)
+        | (k, A.Object inner) <- AKM.toList km
+        , Just v <- [AKM.lookup "value" inner]
+        ]
+      Right _             -> pure Map.empty
+
+jsonAsString :: A.Value -> String
+jsonAsString (A.String t) = T.unpack t
+jsonAsString v            = L8.unpack (A.encode v)
+
+-- | Compute a fresh generator value (output not pinned in tfstate).
 materializeGenerator
-  :: FilePath
-  -> (Source -> IO String)   -- ^ how to resolve a Source in this context
-  -> String                  -- ^ tfstate output name
+  :: (Source -> IO String)   -- ^ how to resolve a Source in this context
   -> Generator
   -> IO String
-materializeGenerator dir resolveSrc name g = do
-  (ec, existing) <- captureExit "tofu" ["-chdir=" <> dir, "output", "-raw", name]
-  if ec == ExitSuccess && not (null existing)
-    then pure existing
-    else case g of
-      Once   _ c     -> capture "sh" ["-c", c]
-      Derive _ src c -> do
-        v <- resolveSrc src
-        capture "sh" ["-c", "printf '%s\\n' " <> shellSingle v <> " | " <> c]
+materializeGenerator resolveSrc g = case g of
+  Once   _ c     -> capture "sh" ["-c", c]
+  Derive _ src c -> do
+    v <- resolveSrc src
+    capture "sh" ["-c", "printf '%s\\n' " <> shellSingle v <> " | " <> c]
 
 -- ------------------------------------------------------------------ per-host
 

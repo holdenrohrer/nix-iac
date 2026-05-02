@@ -10,7 +10,9 @@ common opts
   ghc-options:      -Wall -Wcompat -Wunused-packages -Werror=missing-fields
   build-depends:
       base                 ^>= 4.20
+    , aeson
     , bytestring
+    , text
     , process
     , directory
     , filepath

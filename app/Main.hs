@@ -1,8 +1,10 @@
 module Main (main) where
 
 import           NixIac             (greet)
+import qualified NixIac.Deploy      as Deploy
 import qualified NixIac.Nixify      as Nixify
 import qualified NixIac.Probe       as Probe
+import qualified NixIac.Reboot      as Reboot
 import           NixIac.Run         (die)
 import qualified NixIac.TfState     as TfState
 import           System.Environment (getArgs)
@@ -23,6 +25,10 @@ dispatch ("nixify" : name : flake : host : sshKey : rest) =
   where
     extrasOf (extras : _) | not (null extras) = Just extras
     extrasOf _                                = Nothing
+dispatch ["deploy", flake, name, host, sshKey] =
+  Deploy.deployWithRollback flake name host sshKey
+dispatch ["reboot-if-boot-critical", host, sshKey] =
+  Reboot.rebootIfBootCritical host sshKey
 dispatch _ = die usage
   where
     usage = unlines
@@ -32,4 +38,6 @@ dispatch _ = die usage
       , "  infra tfstate private <KEY>"
       , "  infra probe-nixos <HOST> <SSH-KEY>"
       , "  infra nixify <NAME> <FLAKE> <HOST> <SSH-KEY> [EXTRAS-DIR]"
+      , "  infra deploy <FLAKE> <NAME> <HOST> <SSH-KEY>"
+      , "  infra reboot-if-boot-critical <HOST> <SSH-KEY>"
       ]

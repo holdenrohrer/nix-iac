@@ -20,7 +20,10 @@ common opts
 library
   import:           opts
   hs-source-dirs:   src
-  exposed-modules:  NixIac
+  exposed-modules:
+      NixIac
+    , NixIac.Run
+    , NixIac.TfState
 
 executable infra
   import:           opts

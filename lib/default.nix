@@ -61,7 +61,7 @@ let
     serverSecrets, serverSecretsFromTfState, serverSecretsPath,
     stateDir, tfConfig, sopsFile, envFromSops,
   }: pkgs.writeShellApplication {
-      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" ];
+      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" "SC2016" ];
     name = "infra-${name}";
     runtimeInputs = [
       pkgs.opentofu pkgs.git pkgs.openssh pkgs.coreutils
@@ -170,7 +170,7 @@ let
 
   mkDestroyApp = { stateDir, tfConfig, sopsFile, envFromSops }:
     pkgs.writeShellApplication {
-      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" ];
+      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" "SC2016" ];
       name = "infra-destroy";
       runtimeInputs = [ pkgs.opentofu pkgs.git pkgs.coreutils pkgs.sops pkgs.yq-go ];
       text = ''
@@ -183,7 +183,7 @@ let
 
   mkImportApp = { stateDir, tfConfig, sopsFile, envFromSops, importMap }:
     pkgs.writeShellApplication {
-      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" ];
+      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" "SC2016" ];
       name = "infra-import";
       runtimeInputs = [ pkgs.opentofu pkgs.git pkgs.coreutils pkgs.sops pkgs.yq-go ];
       text = ''
@@ -199,7 +199,7 @@ let
 
   mkSopsApp = { sopsFile }:
     pkgs.writeShellApplication {
-      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" ];
+      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" "SC2016" ];
       name = "sops-edit";
       runtimeInputs = [ pkgs.sops ];
       text = ''
@@ -210,7 +210,7 @@ let
 
   mkUmbrellaApp = { hostNames, hostApps }:
     pkgs.writeShellApplication {
-      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" ];
+      excludeShellChecks = [ "SC2155" "SC2046" "SC2086" "SC2016" ];
       name = "infra";
       runtimeInputs = [];
       text = lib.concatMapStringsSep "\n"

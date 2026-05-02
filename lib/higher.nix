@@ -73,6 +73,12 @@ let
       #   serverSecrets.api_token = buildfarm.use "api_token";
       use = key: tfStateOutput "${name}_${key}";
 
+      # Reference a generated value from inside a *terranix module* (returns
+      # a `${...}` interpolation string suitable for embedding in HCL/JSON).
+      #   resource.hcloud_ssh_key.x.public_key = buildfarm.tfRef "ssh_pub";
+      # Keeps the `terraform_data` storage layout opaque to consumers.
+      tfRef = key: "\${terraform_data.${name}_${key}.output}";
+
       # Terranix module: variable + terraform_data + outputs for each generator.
       # Variables and outputs are prefixed with the host name to avoid collisions
       # across hosts in a single-flake-multiple-hosts config.

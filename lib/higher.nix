@@ -145,9 +145,9 @@ let
           ${if gen.type == "once" then ''
             ${genName}_val="$(${gen.command})"
           '' else ''
-            ${genName}_val="$(printf '%s' "\$${gen.from}_val" | ${gen.command})"
+            ${genName}_val="$(printf '%s' "${"$" + gen.from + "_val"}" | ${gen.command})"
           ''}
-          export ${varName}="$${genName}_val"
+          export ${varName}="${"$" + genName + "_val"}"
         fi
       '';
 

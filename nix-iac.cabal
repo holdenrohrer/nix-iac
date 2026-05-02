@@ -22,6 +22,8 @@ library
   hs-source-dirs:   src
   exposed-modules:
       NixIac
+    , NixIac.Nixify
+    , NixIac.Probe
     , NixIac.Run
     , NixIac.TfState
 

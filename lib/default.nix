@@ -124,13 +124,15 @@ let
       sops --config /dev/null --encrypt --input-type yaml --output-type yaml --age "$age_pub" "$tmp/server-plain.yaml" \
         > "$tmp/server-secrets.yaml"
 
-      # Probe and branch
+      # Probe: distinguish a real installed NixOS from a kexec'd nixos-installer.
+      # The installer has /etc/NIXOS on tmpfs; a real install has it on a real fs.
+      probe_cmd='[ -e /etc/NIXOS ] && [ "$(stat -f -c %T /)" != "tmpfs" ]'
       if ssh -i "$tmp/ssh.key" \
              -o StrictHostKeyChecking=accept-new \
              -o UserKnownHostsFile="$tf_dir/known_hosts" \
              -o ConnectTimeout=10 \
              -o BatchMode=yes \
-             "root@$ip" "test -e /etc/NIXOS" 2>/dev/null; then
+             "root@$ip" "$probe_cmd" 2>/dev/null; then
         echo "==> NixOS detected — colmena update"
         # Push the secrets file via colmena keys, then activate
         export COLMENA_TARGET_HOST="$ip"

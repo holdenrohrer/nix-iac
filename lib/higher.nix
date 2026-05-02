@@ -51,7 +51,7 @@ let
         age_priv = once "age-keygen 2>/dev/null";
         age_pub  = derive' "age_priv" "age-keygen -y /dev/stdin";
         ssh_priv = once ''
-          f=$(mktemp)
+          f=$(mktemp -u)
           ssh-keygen -t ed25519 -N "" -C "${name}" -f "$f" >/dev/null
           cat "$f"
           rm -f "$f" "$f.pub"

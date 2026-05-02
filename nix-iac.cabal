@@ -16,17 +16,23 @@ common opts
     , aeson
     , directory
     , filepath
+    , containers
+    , temporary
+    , unix
 
 library
   import:           opts
   hs-source-dirs:   src
   exposed-modules:
       NixIac
+    , NixIac.Apply
+    , NixIac.Config
     , NixIac.Deploy
     , NixIac.Nixify
     , NixIac.Probe
     , NixIac.Reboot
     , NixIac.Run
+    , NixIac.Sops
     , NixIac.TfState
 
 executable infra

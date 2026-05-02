@@ -1,6 +1,7 @@
 module Main (main) where
 
 import           NixIac             (greet)
+import qualified NixIac.Apply       as Apply
 import qualified NixIac.Deploy      as Deploy
 import qualified NixIac.Nixify      as Nixify
 import qualified NixIac.Probe       as Probe
@@ -29,6 +30,8 @@ dispatch ["deploy", flake, name, host, sshKey] =
   Deploy.deployWithRollback flake name host sshKey
 dispatch ["reboot-if-boot-critical", host, sshKey] =
   Reboot.rebootIfBootCritical host sshKey
+dispatch ["apply", configPath] =
+  Apply.apply configPath
 dispatch _ = die usage
   where
     usage = unlines
@@ -40,4 +43,5 @@ dispatch _ = die usage
       , "  infra nixify <NAME> <FLAKE> <HOST> <SSH-KEY> [EXTRAS-DIR]"
       , "  infra deploy <FLAKE> <NAME> <HOST> <SSH-KEY>"
       , "  infra reboot-if-boot-critical <HOST> <SSH-KEY>"
+      , "  infra apply <CONFIG.JSON>"
       ]

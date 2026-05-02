@@ -19,8 +19,6 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # The Haskell orchestration binary. Built once; wrapped at runtime
-        # with PATH containing every external tool it shells out to.
         infraUnwrapped = pkgs.haskellPackages.callCabal2nix "nix-iac" ./. {};
 
         runtimeTools = [
@@ -38,23 +36,14 @@
             --prefix PATH : ${pkgs.lib.makeBinPath runtimeTools}
         '';
 
-        # Backwards-compat: the bash CLIs and the higher-order `mkHost` /
-        # `mkInfraApp` API still live in lib/. mkInfraApp will migrate to
-        # invoking the Haskell binary in M5; until then it keeps working.
-        cliTools = import ./lib/cli.nix { inherit pkgs system nixos-anywhere deploy-rs; };
-
-        bundle = pkgs.symlinkJoin {
-          name = "nix-iac";
-          paths = builtins.attrValues cliTools;
-        };
-
         higherOrder = import ./lib/higher.nix {
-          inherit pkgs system deploy-rs bundle;
+          inherit pkgs system deploy-rs infra;
           lib = pkgs.lib;
         };
       in {
-        packages = cliTools // { default = bundle; inherit infra; };
-        lib = higherOrder;
+        packages.default = infra;
+        packages.infra   = infra;
+        lib              = higherOrder;
 
         apps.infra = {
           type = "app";

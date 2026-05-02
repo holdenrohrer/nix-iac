@@ -27,7 +27,9 @@ let
   inherit (pkgs) lib;
   nixos-anywhere = "github:nix-community/nixos-anywhere";
 
-  # Common preamble: render terranix → JSON, init backend, decrypt operator sops.
+  # Common preamble: decrypt operator sops, render terranix → JSON.
+  # `tofu init` is called AFTER envFromSops sets cloud creds (since the S3
+  # backend init queries the bucket).
   preamble = { stateDir, tfConfig, sopsFile }: ''
     root="$(git rev-parse --show-toplevel)"
     tf_dir="$root/${stateDir}"
@@ -37,11 +39,15 @@ let
 
     mkdir -p "$tf_dir"
     install -m 644 ${tfConfig} "$tf_dir/config.tf.json"
-    ( cd "$tf_dir" && tofu init -input=false -reconfigure >/dev/null )
 
     # Decrypt operator sops file (asks GPG agent on first run per session)
     sops --config /dev/null -d "${toString sopsFile}" > "$tmp/plain.yaml"
     chmod 600 "$tmp/plain.yaml"
+  '';
+
+  # Run tofu init AFTER cloud creds are exported.
+  tfInit = ''
+    ( cd "$tf_dir" && tofu init -input=false -reconfigure >/dev/null )
   '';
 
   # Export env vars from sops keys (raw — caller picks the env var name).
@@ -65,6 +71,7 @@ let
     text = ''
       ${preamble { inherit stateDir tfConfig sopsFile; }}
       ${envFromSopsScript envFromSops}
+      ${tfInit}
 
       # If host's keypairs are not yet in tfstate, generate fresh and pass via TF_VAR.
       # `terraform_data` with `ignore_changes` pins them after first apply.
@@ -167,6 +174,7 @@ let
       text = ''
         ${preamble { inherit stateDir tfConfig sopsFile; }}
         ${envFromSopsScript envFromSops}
+        ${tfInit}
         ( cd "$tf_dir" && tofu destroy -auto-approve )
       '';
     };
@@ -179,6 +187,7 @@ let
       text = ''
         ${preamble { inherit stateDir tfConfig sopsFile; }}
         ${envFromSopsScript envFromSops}
+        ${tfInit}
         cd "$tf_dir"
         ${lib.concatStringsSep "\n" (lib.mapAttrsToList (resource: id:
           "tofu import '${resource}' '${id}' || true"

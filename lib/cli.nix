@@ -74,9 +74,12 @@ in {
       name="$2"
       host="$3"
       ssh_key="$4"
+      # `--skip-checks`: don't pre-flight-check the entire flake (deploy-rs
+       # default runs `nix flake check`, which fails on unrelated outputs).
       exec deploy "$flake#$name" \
         --hostname "$host" \
-        --ssh-opts "-i $ssh_key -o StrictHostKeyChecking=accept-new"
+        --ssh-opts "-i $ssh_key -o StrictHostKeyChecking=accept-new" \
+        --skip-checks
     '';
   };
 

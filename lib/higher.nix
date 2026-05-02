@@ -1,10 +1,5 @@
 # Higher-order helpers: declarative host bindings + the orchestration script
 # that ties terranix + sops + the four CLI tools together for the common case.
-#
-# Public surface:
-#   sopsKey, tfStateOutput, literal, cmd  -- tagged constructors
-#   mkHost { name, serverSecrets }        -- bind a host name to its outputs/modules
-#   mkInfraApp { ... }                    -- one-shot deploy orchestrator
 
 { pkgs, system, deploy-rs, bundle, lib }:
 
@@ -13,16 +8,27 @@ let
 
   # --- Tagged source constructors -------------------------------------------
   # `sopsKey` is curried: bind a file once, then call repeatedly per key.
-  #   infra_sops = sopsKey ./secrets/infra.yaml;
-  #   serverSecrets.github_token = infra_sops "github_token";
+  #   infraSops = sopsKey ./secrets/infra.yaml;
+  #   serverSecrets.github_token = infraSops "github_token";
   sopsKey       = file: key: { kind = "sops"; payload = { inherit file key; }; };
   tfStateOutput = name:       { kind = "tfstate"; payload = name; };
   literal       = val:        { kind = "literal"; payload = val; };
   cmd           = c:          { kind = "cmd"; payload = c; };
 
+  # --- Generated-secret constructors ----------------------------------------
+  # Each one is a "kind" stored in tfstate via terraform_data with
+  # ignore_changes — generated on first apply, pinned forever after.
+  #
+  #   once   <command>           run command, capture stdout, store
+  #   once'  <command>           same, but value is non-sensitive (public)
+  #   derive <from> <command>    pipe `from` value through command, store
+  #   derive' <from> <command>   same, sensitive
+  once    = command:       { type = "once";   inherit command; sensitive = true;  };
+  once'   = command:       { type = "once";   inherit command; sensitive = false; };
+  derive  = from: command: { type = "derive"; inherit from command; sensitive = false; };
+  derive' = from: command: { type = "derive"; inherit from command; sensitive = true; };
+
   # Render a tagged source as a bash expression that produces the value.
-  # `get_tf` is the only bash function assumed to be in scope; sops calls are
-  # emitted directly with the per-source file path.
   renderSource = src:
     if      src.kind == "sops"
       then ''$(sops --config /dev/null -d --extract "[\"${src.payload.key}\"]" "${toString src.payload.file}")''
@@ -31,61 +37,69 @@ let
     else if src.kind == "cmd"      then "$(${src.payload})"
     else throw "renderSource: unknown kind '${src.kind}'";
 
-  # --- mkHost: bind a host name to all its derived attributes ---------------
-  mkHost = { name, serverSecrets ? {}, ipOutput ? "${name}_ip" }:
-    let outputs = {
-          ip      = ipOutput;
-          sshPriv = "${name}_ssh_priv";
-          sshPub  = "${name}_ssh_pub";
-          agePriv = "${name}_age_priv";
-          agePub  = "${name}_age_pub";
-        };
+  # --- mkHost ---------------------------------------------------------------
+  mkHost = {
+    name,
+    serverSecrets ? {},
+    generators    ? {},
+    ipOutput      ? "${name}_ip",
+  }:
+    let
+      # Built-in generators every nixifiable host needs.
+      # `2>/dev/null` suppresses age-keygen's "Public key:" banner on stderr.
+      builtinGenerators = {
+        age_priv = once "age-keygen 2>/dev/null";
+        age_pub  = derive' "age_priv" "age-keygen -y /dev/stdin";
+        ssh_priv = once ''
+          f=$(mktemp)
+          ssh-keygen -t ed25519 -N "" -C "${name}" -f "$f" >/dev/null
+          cat "$f"
+          rm -f "$f" "$f.pub"
+        '';
+        ssh_pub  = derive' "ssh_priv" "ssh-keygen -y -f /dev/stdin";
+      };
+      allGenerators = builtinGenerators // generators;
+
+      outputs = {
+        ip = ipOutput;
+      } // builtins.mapAttrs (n: _: "${name}_${n}") allGenerators;
     in rec {
       inherit name serverSecrets outputs;
+      generators = allGenerators;
+
       serverSecretsPath = "/var/lib/sops-nix/${name}-secrets.yaml";
 
-      # Terranix module emitting variables (set via TF_VAR at deploy), the
-      # terraform_data resource that pins them across applies, and the
-      # outputs the orchestrator reads back. The consumer's terranix
-      # config still owns the actual cloud resource (hcloud_server etc) and
-      # the `output.${ipOutput}` referencing it.
+      # Convenience: refer to a generated value as a tagged source.
+      #   serverSecrets.api_token = buildfarm.use "api_token";
+      use = key: tfStateOutput "${name}_${key}";
+
+      # Terranix module: variable + terraform_data + outputs for each generator.
       terranixModule = {
-        variable."${name}_age_priv" = { type = "string"; sensitive = true; default = "ignored"; };
-        variable."${name}_age_pub"  = { type = "string"; default = "ignored"; };
-        variable."${name}_ssh_priv" = { type = "string"; sensitive = true; default = "ignored"; };
-        variable."${name}_ssh_pub"  = { type = "string"; default = "ignored"; };
+        variable = builtins.mapAttrs (n: g: {
+          type = "string";
+          sensitive = g.sensitive;
+          default = "ignored";
+        }) allGenerators;
 
         resource.terraform_data."${name}_keys" = {
-          input = {
-            age_priv = "\${var.${name}_age_priv}";
-            age_pub  = "\${var.${name}_age_pub}";
-            ssh_priv = "\${var.${name}_ssh_priv}";
-            ssh_pub  = "\${var.${name}_ssh_pub}";
-          };
+          input = builtins.mapAttrs (n: _: "\${var.${name}_${n}}") allGenerators;
           lifecycle = { ignore_changes = [ "input" ]; };
         };
 
-        output = {
-          "${outputs.agePriv}" = { value = "\${terraform_data.${name}_keys.output.age_priv}"; sensitive = true; };
-          "${outputs.agePub}"  = { value = "\${terraform_data.${name}_keys.output.age_pub}"; };
-          "${outputs.sshPriv}" = { value = "\${terraform_data.${name}_keys.output.ssh_priv}"; sensitive = true; };
-          "${outputs.sshPub}"  = { value = "\${terraform_data.${name}_keys.output.ssh_pub}"; };
-        };
+        output = builtins.mapAttrs (n: g: {
+          value = "\${terraform_data.${name}_keys.output.${n}}";
+          sensitive = g.sensitive;
+        }) allGenerators;
       };
 
-      # NixOS module wiring sops-nix for this host's serverSecrets. Consumer
-      # imports this into nixosConfigurations.${name}.modules.
       nixosModule = { ... }: {
-        sops.age.sshKeyPaths = [ ];
-        sops.age.keyFile     = "/var/lib/sops-nix/key.txt";
-        sops.defaultSopsFile = serverSecretsPath;
-        sops.validateSopsFiles = false;  # path is on the target, not in the store
+        sops.age.sshKeyPaths   = [ ];
+        sops.age.keyFile       = "/var/lib/sops-nix/key.txt";
+        sops.defaultSopsFile   = serverSecretsPath;
+        sops.validateSopsFiles = false;
         sops.secrets = builtins.mapAttrs (_: _: { }) serverSecrets;
       };
 
-      # deploy-rs node spec. Takes the consumer's `self` (flake) so it can
-      # reference nixosConfigurations.${name} without nix-iac knowing about
-      # the consumer's flake structure.
       deployNode = flake: {
         hostname = "_overridden_at_runtime_";
         sshUser  = "root";
@@ -102,39 +116,44 @@ let
 
   # --- Orchestration script generator ---------------------------------------
   mkInfraApp = {
-    flake,                   # consumer's `self` (a flake)
-    terranixConfig,          # derivation: the rendered config.tf.json
-    deployEnv ? {},          # { ENV_VAR = sopsKey file "..."; ... }
+    flake,                   # consumer's `self`
+    terranixConfig,          # rendered config.tf.json derivation
+    deployEnv ? {},          # { ENV_VAR = sopsKey ...; ... }
     hosts,                   # [ (mkHost {...}) ... ]
     stateDir ? ".tf-state",
   }:
   let
-    flakeRef = "${flake}";  # store path of the flake
+    flakeRef = "${flake}";
 
-    # Bash to populate process env from sops/tfstate/etc.
     exportEnv = mapping: lib.concatStringsSep "\n" (
       lib.mapAttrsToList (var: src:
         ''export ${var}="${renderSource src}"''
       ) mapping);
 
-    # Pre-apply: per host, generate keypairs if not yet in tfstate.
-    preApply = host: ''
-      if ! tofu -chdir="$tf_dir" output -raw ${host.outputs.agePriv} >/dev/null 2>&1; then
-        echo "==> ${host.name}: first apply, generating keypairs"
-        age-keygen -o "$tmp/${host.name}.age" 2>/dev/null
-        ssh-keygen -t ed25519 -N "" -C "${host.name}" -f "$tmp/${host.name}.ssh" >/dev/null
-        export TF_VAR_${host.name}_age_priv="$(cat "$tmp/${host.name}.age")"
-        export TF_VAR_${host.name}_age_pub="$(age-keygen -y "$tmp/${host.name}.age")"
-        export TF_VAR_${host.name}_ssh_priv="$(cat "$tmp/${host.name}.ssh")"
-        export TF_VAR_${host.name}_ssh_pub="$(cat "$tmp/${host.name}.ssh.pub")"
-      else
-        for v in age_priv age_pub ssh_priv ssh_pub; do
-          export "TF_VAR_${host.name}_$v=ignored"
-        done
-      fi
-    '';
+    # Per-generator: skip if already in tfstate, else generate and export TF_VAR.
+    # Iteration is alphabetical (Nix attrset order); derive generators must
+    # sort AFTER their `from` deps (e.g. age_priv < age_pub) — true by default.
+    genBlock = host: genName: gen:
+      let
+        outputName = "${host.name}_${genName}";
+        varName    = "TF_VAR_${outputName}";
+      in ''
+        if existing=$(get_tf ${outputName} 2>/dev/null) && [ -n "$existing" ]; then
+          ${genName}_val="$existing"
+          export ${varName}=ignored
+        else
+          ${if gen.type == "once" then ''
+            ${genName}_val="$(${gen.command})"
+          '' else ''
+            ${genName}_val="$(printf '%s' "$${gen.from}_val" | ${gen.command})"
+          ''}
+          export ${varName}="$${genName}_val"
+        fi
+      '';
 
-    # Post-apply: per host, build blob, ship, nixify, deploy, reboot.
+    perHostPreApply = host: lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (genBlock host) host.generators);
+
     perHostDeploy = host:
       let
         secretLines = lib.concatStringsSep "\n" (
@@ -142,11 +161,12 @@ let
       in ''
         echo "==> ${host.name}: deploying"
         ip="$(get_tf ${host.outputs.ip})"
-        age_pub="$(get_tf ${host.outputs.agePub})"
-        ssh_pub="$(get_tf ${host.outputs.sshPub})"
-        # Ensure a trailing newline; libcrypto rejects SSH keys without one
-        { get_tf ${host.outputs.sshPriv}; printf '\n'; } > "$tmp/${host.name}.ssh.key"
-        { get_tf ${host.outputs.agePriv}; printf '\n'; } > "$tmp/${host.name}.age.key"
+        age_pub="$(get_tf ${host.outputs.age_pub})"
+        ssh_pub="$(get_tf ${host.outputs.ssh_pub})"
+
+        # Materialize the key files (with trailing newline; libcrypto needs it)
+        { get_tf ${host.outputs.ssh_priv}; printf '\n'; } > "$tmp/${host.name}.ssh.key"
+        { get_tf ${host.outputs.age_priv}; printf '\n'; } > "$tmp/${host.name}.age.key"
         chmod 600 "$tmp/${host.name}.ssh.key" "$tmp/${host.name}.age.key"
 
         cat > "$tmp/${host.name}.blob.yaml" <<EOF
@@ -181,7 +201,7 @@ let
     name = "infra";
     excludeShellChecks = shellChecks;
     runtimeInputs = [
-      bundle  # nix-iac CLI tools
+      bundle
       pkgs.opentofu pkgs.sops pkgs.age
       pkgs.openssh pkgs.git pkgs.coreutils
     ];
@@ -198,7 +218,7 @@ let
       install -m 644 ${terranixConfig} "$tf_dir/config.tf.json"
       tofu -chdir="$tf_dir" init -input=false -reconfigure >/dev/null
 
-      ${lib.concatMapStringsSep "\n" preApply hosts}
+      ${lib.concatMapStringsSep "\n" perHostPreApply hosts}
 
       tofu -chdir="$tf_dir" apply -auto-approve -input=false
 
@@ -207,5 +227,8 @@ let
   };
 
 in {
-  inherit sopsKey tfStateOutput literal cmd mkHost mkInfraApp;
+  inherit
+    sopsKey tfStateOutput literal cmd
+    once once' derive derive'
+    mkHost mkInfraApp;
 }

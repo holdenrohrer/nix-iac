@@ -1,5 +1,5 @@
 {
-  description = "Bundle of idempotent-by-contract CLI tools for NixOS deploy orchestration";
+  description = "NixOS deploy orchestration: idempotent CLI tools + declarative host bindings";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -18,15 +18,20 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        tools = import ./lib { inherit pkgs system nixos-anywhere deploy-rs; };
-      in {
-        # Each tool individually
-        packages = tools // {
-          # Bundle: add to runtimeInputs/buildInputs to get all four on PATH.
-          default = pkgs.symlinkJoin {
-            name = "nix-iac";
-            paths = builtins.attrValues tools;
-          };
+
+        cliTools = import ./lib/cli.nix { inherit pkgs system nixos-anywhere deploy-rs; };
+
+        bundle = pkgs.symlinkJoin {
+          name = "nix-iac";
+          paths = builtins.attrValues cliTools;
         };
+
+        higherOrder = import ./lib/higher.nix {
+          inherit pkgs system deploy-rs bundle;
+          lib = pkgs.lib;
+        };
+      in {
+        packages = cliTools // { default = bundle; };
+        lib = higherOrder;
       });
 }

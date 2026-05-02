@@ -85,13 +85,16 @@ let
           default = "ignored";
         }) allGenerators;
 
-        resource.terraform_data."${name}_keys" = {
-          input = lib.mapAttrs (n: _: "\${var.${prefix}${n}}") allGenerators;
+        # One terraform_data per generator — additive: introducing a new
+        # generator doesn't disturb existing ones (each has its own
+        # `ignore_changes = [input]` lifecycle and its own state row).
+        resource.terraform_data = lib.mapAttrs' (n: _: lib.nameValuePair "${prefix}${n}" {
+          input = "\${var.${prefix}${n}}";
           lifecycle = { ignore_changes = [ "input" ]; };
-        };
+        }) allGenerators;
 
         output = lib.mapAttrs' (n: g: lib.nameValuePair "${prefix}${n}" {
-          value = "\${terraform_data.${name}_keys.output.${n}}";
+          value = "\${terraform_data.${prefix}${n}.output}";
           sensitive = g.sensitive;
         }) allGenerators;
       };

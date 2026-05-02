@@ -79,11 +79,11 @@ generatorValue dir h prior k g = do
   (ec, existing) <- captureExit "tofu" ["-chdir=" <> dir, "output", "-raw", tfKey]
   if ec == ExitSuccess && not (null existing)
     then setEnv ("TF_VAR_" <> tfKey) "ignored" >> pure existing
-    else case kind g of
-      Once     -> capture "sh" ["-c", command g]
-      Derive f -> case Map.lookup f prior of
+    else case g of
+      Once   { genCommand = c }              -> capture "sh" ["-c", c]
+      Derive { genFrom = f, genCommand = c } -> case Map.lookup f prior of
         Nothing -> die ("derive generator '" <> k <> "' references unknown source '" <> f <> "'")
-        Just v  -> capture "sh" ["-c", "printf '%s\\n' " <> shellSingle v <> " | " <> command g]
+        Just v  -> capture "sh" ["-c", "printf '%s\\n' " <> shellSingle v <> " | " <> c]
 
 deployHost :: ApplyConfig -> HostSpec -> IO ()
 deployHost cfg h = withSystemTempDirectory ("nix-iac-" <> name h) $ \tmp -> do

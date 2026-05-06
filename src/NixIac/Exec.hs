@@ -28,6 +28,7 @@ import           Control.Monad            (forM_)
 import           NixIac.Plan
 import qualified NixIac.Sops              as Sops
 import           NixIac.Run               (capture, die)
+import qualified System.Directory
 import           System.Directory         (createDirectoryIfMissing,
                                             removePathForcibly,
                                             findExecutable)
@@ -86,10 +87,17 @@ execEnv plan (cmd : args) = do
              : ("GIT_SSH_COMMAND", "ssh -F " <> sshConfig)
              : [ kv | kv <- parentEnv, fst kv `notElem` ["PATH", "GIT_SSH_COMMAND"] ]
 
-    -- Don't pre-resolve cmd against parent PATH — that would bypass our
-    -- shim dir for ssh/scp/sftp/rsync. Pass cmd bare; the child's execvp
-    -- uses the env we hand it, where binDir is first on PATH.
-    (_, _, _, ph) <- createProcess (proc cmd args)
+    -- Resolve cmd against the augmented PATH (binDir first). The Haskell
+    -- process lib's execvp does path lookup against the parent's
+    -- environment regardless of CreateProcess.env, so passing cmd bare
+    -- bypasses the shim. Look it up ourselves and pass the absolute path.
+    let envPath = binDir <> ":" <> envOr parentEnv "PATH" "/usr/bin:/bin"
+    resolved <- resolveOnPath envPath cmd
+    let absCmd = case resolved of
+          Just p  -> p
+          Nothing -> cmd  -- let exec fail loudly with a clear "not found"
+
+    (_, _, _, ph) <- createProcess (proc absCmd args)
                        { env       = Just env'
                        , std_in    = Inherit
                        , std_out   = Inherit
@@ -196,6 +204,33 @@ resolveDeployEnv _ (Sops f k)   = Sops.decryptKey f k
 resolveDeployEnv key (TfOut s _) = die
   ("exec: deployEnv binding " <> key <> " references tfstate " <> s
    <> "; only literal/cmd/sops are legal here")
+
+-- | Look up a bare command name against an explicit PATH string. Returns
+-- the absolute path of the first executable file found, or Nothing.
+-- Slash-bearing names are returned as-is. We can't use Directory.findExecutable
+-- here because it consults the process's current PATH env var, ignoring
+-- whatever PATH we'd like to search.
+resolveOnPath :: String -> String -> IO (Maybe FilePath)
+resolveOnPath _    cmd | '/' `elem` cmd = pure (Just cmd)
+resolveOnPath path cmd = go (splitOn ':' path)
+  where
+    go []     = pure Nothing
+    go (d:ds) = do
+      let p = (if null d then "." else d) </> cmd
+      ok <- isExecutableFileSafe p
+      if ok then pure (Just p) else go ds
+
+isExecutableFileSafe :: FilePath -> IO Bool
+isExecutableFileSafe p = do
+  e <- System.Directory.doesFileExist p
+  if not e then pure False else do
+    perms <- System.Directory.getPermissions p
+    pure (System.Directory.executable perms)
+
+splitOn :: Char -> String -> [String]
+splitOn c s = case break (== c) s of
+  (h, []) -> [h]
+  (h, _:t) -> h : splitOn c t
 
 runtimeDirBase :: IO FilePath
 runtimeDirBase = do

@@ -80,5 +80,11 @@ data HostCfg = HostCfg
   , hSshPub            :: Source
   , hAgePriv           :: Source
   , hAgePub            :: Source
+  , hHostKeyPriv       :: Source
+    -- ^ Server's SSH host key (private). Shipped to the target via
+    -- nixos-anywhere extras at /etc/ssh/ssh_host_ed25519_key.
+  , hHostKeyPub        :: Source
+    -- ^ Server's SSH host key (public). Used to populate the
+    -- per-invocation known_hosts in 'Exec'.
   , hServerSecrets     :: [(String, Source)]
   }

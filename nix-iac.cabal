@@ -27,6 +27,7 @@ library
       NixIac.Orchestrator
     , NixIac.Plan
     , NixIac.Deploy
+    , NixIac.Exec
     , NixIac.Nixify
     , NixIac.Probe
     , NixIac.Reboot

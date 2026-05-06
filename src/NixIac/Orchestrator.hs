@@ -139,11 +139,13 @@ materializeGenerator resolveSrc g = case g of
 
 deployHost :: FilePath -> String -> HostCfg -> IO ()
 deployHost root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \tmp -> do
-  ip      <- resolvePostApply root (hIp h)
-  agePub  <- resolvePostApply root (hAgePub h)
-  agePriv <- resolvePostApply root (hAgePriv h)
-  sshPriv <- resolvePostApply root (hSshPriv h)
-  sshPub  <- resolvePostApply root (hSshPub h)
+  ip          <- resolvePostApply root (hIp h)
+  agePub      <- resolvePostApply root (hAgePub h)
+  agePriv     <- resolvePostApply root (hAgePriv h)
+  sshPriv     <- resolvePostApply root (hSshPriv h)
+  sshPub      <- resolvePostApply root (hSshPub h)
+  hostKeyPriv <- resolvePostApply root (hHostKeyPriv h)
+  hostKeyPub  <- resolvePostApply root (hHostKeyPub h)
 
   let sshKey  = tmp </> (hName h <> ".ssh.key")
       ageKey  = tmp </> (hName h <> ".age.key")
@@ -168,6 +170,14 @@ deployHost root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \
   setFileMode      (extras </> ("var/lib/sops-nix/" <> hName h <> "-secrets.yaml")) 0o600
   writeFile        (extras </> "etc/ssh/authorized_keys.d/root") (sshPub <> "\n")
   setFileMode      (extras </> "etc/ssh/authorized_keys.d/root") 0o600
+  -- Server host key. NixOS activation only generates a missing key file;
+  -- shipping ours via extras pins the host identity to tfstate, so
+  -- subsequent connects can use StrictHostKeyChecking=yes against the
+  -- known_hosts populated by `iac exec`.
+  writeFile        (extras </> "etc/ssh/ssh_host_ed25519_key") (hostKeyPriv <> "\n")
+  setFileMode      (extras </> "etc/ssh/ssh_host_ed25519_key") 0o600
+  writeFile        (extras </> "etc/ssh/ssh_host_ed25519_key.pub") (hostKeyPub <> "\n")
+  setFileMode      (extras </> "etc/ssh/ssh_host_ed25519_key.pub") 0o644
 
   -- Three-way probe: only nixos-anywhere when we *positively confirm*
   -- the host is not yet NixOS. Any ssh failure aborts; we never

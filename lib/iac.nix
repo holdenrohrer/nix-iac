@@ -138,13 +138,27 @@ let
       agePriv = tfState.output "${name}_age_priv" (gen.once "age-keygen 2>/dev/null");
       agePub  = tfState.output "${name}_age_pub"
                  (gen.derive' { from = agePriv; command = "age-keygen -y /dev/stdin"; });
+      # Server-side SSH host key. Generated once and pinned in tfstate; the
+      # private half is shipped to the target via nixos-anywhere extras at
+      # /etc/ssh/ssh_host_ed25519_key. Public half is what `iac exec` writes
+      # into the per-invocation known_hosts so StrictHostKeyChecking=yes is
+      # safe by construction (no TOFU window, no fingerprint surprises on
+      # rebuild — the same key is reinstalled from tfstate every time).
+      hostKeyPriv = tfState.output "${name}_host_priv" (gen.once ''
+        f=$(mktemp -u)
+        ssh-keygen -t ed25519 -N "" -C "${name}-host" -f "$f" >/dev/null
+        cat "$f"
+        rm -f "$f" "$f.pub"
+      '');
+      hostKeyPub  = tfState.output "${name}_host_pub"
+                     (gen.derive' { from = hostKeyPriv; command = "ssh-keygen -y -f /dev/stdin"; });
 
       serverSecretsPath = "/var/lib/sops-nix/${name}-secrets.yaml";
 
       hostRec = tagHost {
         inherit name tfState serverSecrets serverSecretsPath;
         ip = ipOutput;
-        inherit sshPriv sshPub agePriv agePub;
+        inherit sshPriv sshPub agePriv agePub hostKeyPriv hostKeyPub;
 
         nixosModule = { ... }: {
           sops.age.sshKeyPaths   = [ ];
@@ -152,6 +166,15 @@ let
           sops.defaultSopsFile   = serverSecretsPath;
           sops.validateSopsFiles = false;
           sops.secrets = builtins.mapAttrs (_: _: { }) serverSecrets;
+
+          # Pin the host key to the one in tfstate. NixOS activation only
+          # generates a missing key file; nixos-anywhere ships the file via
+          # extras, so activation finds it and skips generation. By listing
+          # only ed25519 we suppress the default rsa key too — modern only.
+          services.openssh.hostKeys = [{
+            type = "ed25519";
+            path = "/etc/ssh/ssh_host_ed25519_key";
+          }];
         };
 
         deployNode = flake: {
@@ -210,7 +233,7 @@ let
   collectSources = v:
     if isSource v       then [ v ]
     else if isHost v    then collectSources (
-        { inherit (v) ip sshPriv sshPub agePriv agePub serverSecrets; })
+        { inherit (v) ip sshPriv sshPub agePriv agePub hostKeyPriv hostKeyPub serverSecrets; })
     else if builtins.isAttrs v then
       lib.concatLists (lib.mapAttrsToList (_: collectSources) v)
     else if builtins.isList v then
@@ -309,6 +332,8 @@ let
            + ", hSshPub = "  + sourceExpr h.sshPub
            + ", hAgePriv = " + sourceExpr h.agePriv
            + ", hAgePub = "  + sourceExpr h.agePub
+           + ", hHostKeyPriv = " + sourceExpr h.hostKeyPriv
+           + ", hHostKeyPub = "  + sourceExpr h.hostKeyPub
            + ", hServerSecrets = " + kv h.serverSecrets
            + " }";
     in ''
@@ -317,7 +342,10 @@ let
       module Main where
 
       import           NixIac.Orchestrator
+      import qualified NixIac.Exec    as Exec
       import qualified System.Process as P
+      import           System.Environment (getArgs)
+      import           System.Exit    (ExitCode (..), exitWith)
       import           System.IO      (hPutStrLn, stderr)
 
       main :: IO ()
@@ -330,8 +358,32 @@ let
               , planDeployEnv = ${kvList envList}
               , planHosts     = [${lib.concatStringsSep ", " (map hostExpr hosts)}]
               }
-        hPutStrLn stderr ("==> nix-iac: stateDir = " <> planStateDir plan)
-        orchestrate plan
+        args <- getArgs
+        case args of
+          []                  -> deployAll plan
+          ("deploy":_)        -> deployAll plan
+          ("exec":rest)       -> Exec.execEnv plan rest
+          ("help":_)          -> usage >> exitWith (ExitSuccess)
+          ("--help":_)        -> usage >> exitWith (ExitSuccess)
+          ("-h":_)            -> usage >> exitWith (ExitSuccess)
+          (cmd:_)             -> do
+            hPutStrLn stderr ("error: unknown subcommand: " <> cmd)
+            usage
+            exitWith (ExitFailure 64)
+        where
+          deployAll p = do
+            hPutStrLn stderr ("==> nix-iac: stateDir = " <> planStateDir p)
+            orchestrate p
+          usage = mapM_ (hPutStrLn stderr)
+            [ "usage: infra <subcommand> [args...]"
+            , ""
+            , "  deploy             Apply tfstates and deploy every host (default)."
+            , "  exec <cmd> [...]   Run <cmd> with ssh/scp/sftp/rsync wrapped to"
+            , "                     resolve every host by name (HostName, IdentityFile,"
+            , "                     UserKnownHostsFile preconfigured from tfstate)."
+            , "                     Materialization is in $XDG_RUNTIME_DIR and is"
+            , "                     cleaned up on exit; nothing touches ~/.ssh."
+            ]
 
       gitRoot :: IO String
       gitRoot = do

@@ -33,3 +33,4 @@ library
     , NixIac.Reboot
     , NixIac.Run
     , NixIac.Sops
+    , NixIac.SshOpts

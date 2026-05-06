@@ -5,16 +5,17 @@
 -- unrelated outputs (xorg refactors, IFD jobs, etc.).
 module NixIac.Deploy (deployWithRollback) where
 
-import NixIac.Run (run)
+import NixIac.Run     (run)
+import NixIac.SshOpts (SshAuth, sshOptString)
 
 deployWithRollback :: String   -- ^ flake reference
                    -> String   -- ^ flake attribute (becomes <flake>#<name>)
                    -> String   -- ^ host
-                   -> FilePath -- ^ ssh private key
+                   -> SshAuth  -- ^ auth (Strict against tfstate-pinned known_hosts)
                    -> IO ()
-deployWithRollback flake name host sshKey = run "deploy"
+deployWithRollback flake name host auth = run "deploy"
   [ flake <> "#" <> name
   , "--hostname", host
-  , "--ssh-opts", "-i " <> sshKey <> " -o StrictHostKeyChecking=accept-new"
+  , "--ssh-opts", sshOptString auth
   , "--skip-checks"
   ]

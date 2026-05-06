@@ -6,15 +6,13 @@
 -- ones to take effect — but only in that case.
 module NixIac.Reboot (rebootIfBootCritical) where
 
-import NixIac.Run (run)
+import NixIac.Run     (run)
+import NixIac.SshOpts (SshAuth, sshArgs)
 
-rebootIfBootCritical :: String -> FilePath -> IO ()
-rebootIfBootCritical host sshKey = run "ssh"
-  [ "-i", sshKey
-  , "-o", "BatchMode=yes"
-  , "-o", "ConnectTimeout=10"
-  , "-o", "StrictHostKeyChecking=accept-new"
-  , "root@" <> host
+rebootIfBootCritical :: String -> SshAuth -> IO ()
+rebootIfBootCritical host auth = run "ssh" $
+  sshArgs auth ++
+  [ "root@" <> host
   , unlines
       [ "set -e"
       , "booted=$(readlink -f /run/booted-system/{kernel,initrd,kernel-modules})"

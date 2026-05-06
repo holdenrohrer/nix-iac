@@ -23,6 +23,7 @@ import qualified NixIac.Probe               as Probe
 import qualified NixIac.Reboot              as Reboot
 import           NixIac.Run                 (capture, captureExit, die, run)
 import qualified NixIac.Sops                as Sops
+import           NixIac.SshOpts             (SshAuth (..), StrictMode (..), sshArgs)
 import           System.Directory           (copyFile, createDirectoryIfMissing)
 import           System.Environment         (setEnv)
 import           System.Exit                (ExitCode (..))
@@ -147,13 +148,30 @@ deployHost root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \
   hostKeyPriv <- resolvePostApply root (hHostKeyPriv h)
   hostKeyPub  <- resolvePostApply root (hHostKeyPub h)
 
-  let sshKey  = tmp </> (hName h <> ".ssh.key")
-      ageKey  = tmp </> (hName h <> ".age.key")
-      blobIn  = tmp </> (hName h <> ".blob.yaml")
-      blobOut = tmp </> (hName h <> ".blob.sops.yaml")
-      extras  = tmp </> "extras"
+  let sshKey      = tmp </> (hName h <> ".ssh.key")
+      ageKey      = tmp </> (hName h <> ".age.key")
+      blobIn      = tmp </> (hName h <> ".blob.yaml")
+      blobOut     = tmp </> (hName h <> ".blob.sops.yaml")
+      extras      = tmp </> "extras"
+      -- Two known_hosts files. `pinned` carries the tfstate-pinned host
+      -- pubkey for strict checks; `tofu` is empty and lets first-contact
+      -- ssh (Probe, Nixify) accept-new without polluting ~/.ssh.
+      knownHostsPinned = tmp </> "known_hosts.pinned"
+      knownHostsTofu   = tmp </> "known_hosts.tofu"
   writeFile sshKey (sshPriv <> "\n"); setFileMode sshKey 0o600
   writeFile ageKey (agePriv <> "\n"); setFileMode ageKey 0o600
+  -- known_hosts entry: alias,IP <space> pubkey. Listing both lets
+  -- ssh root@<ip> verify against the same key as ssh root@<name>.
+  writeFile knownHostsPinned
+    (hName h <> "," <> ip <> " " <> hostKeyPub <> "\n")
+  writeFile knownHostsTofu ""
+
+  let pinned = SshAuth { sshAuthKey = sshKey
+                       , sshAuthKnownHosts = knownHostsPinned
+                       , sshAuthStrict = Strict }
+      tofu   = SshAuth { sshAuthKey = sshKey
+                       , sshAuthKnownHosts = knownHostsTofu
+                       , sshAuthStrict = AcceptNew }
 
   blobLines <- mapM (\(k, src) -> do
                        v <- resolvePostApply root src
@@ -182,31 +200,39 @@ deployHost root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \
   -- Three-way probe: only nixos-anywhere when we *positively confirm*
   -- the host is not yet NixOS. Any ssh failure aborts; we never
   -- silently treat an unreachable host as "needs bootstrap".
-  probe <- Probe.probeNixos ip sshKey
+  --
+  -- Probe runs with AcceptNew on a fresh known_hosts: its outcome is
+  -- determined by the remote /etc/NIXOS test, not by host-key
+  -- verification. Pre-bootstrap hosts wouldn't match tfstate's host key
+  -- anyway. Connections that *follow* a successful IsNixOS go strict
+  -- against the tfstate-pinned known_hosts, so a key mismatch fails the
+  -- deploy at a clean point with a loud SSH error.
+  probe <- Probe.probeNixos ip tofu
   case probe of
     Probe.SshFailed n ->
       die ("probe: ssh to " <> ip <> " failed (exit " <> show n
            <> "); refusing to bootstrap a host we can't reach")
     Probe.IsNotNixOS -> do
       IO.hPutStrLn IO.stderr ("==> " <> hName h <> ": not NixOS, bootstrapping via nixos-anywhere")
-      Nixify.nixify (hName h) flakeRef ip sshKey (Just extras)
+      -- Nixify is pre-bootstrap → AcceptNew. After it completes the box
+      -- has the tfstate-pinned host key from extras, so subsequent ops
+      -- (Deploy/Reboot below) verify strictly.
+      Nixify.nixify (hName h) flakeRef ip tofu (Just extras)
     Probe.IsNixOS -> do
       IO.hPutStrLn IO.stderr ("==> " <> hName h <> ": already NixOS, shipping new sops blob")
-      run "scp"
-        [ "-i", sshKey
-        , "-o", "StrictHostKeyChecking=accept-new"
-        , blobOut
+      run "scp" $
+        sshArgs pinned ++
+        [ blobOut
         , "root@" <> ip <> ":" <> hServerSecretsPath h <> ".new"
         ]
-      run "ssh"
-        [ "-i", sshKey
-        , "-o", "StrictHostKeyChecking=accept-new"
-        , "root@" <> ip
+      run "ssh" $
+        sshArgs pinned ++
+        [ "root@" <> ip
         , "install -m 600 " <> hServerSecretsPath h <> ".new " <> hServerSecretsPath h
         ]
 
-  Deploy.deployWithRollback flakeRef (hName h) ip sshKey
-  Reboot.rebootIfBootCritical ip sshKey
+  Deploy.deployWithRollback flakeRef (hName h) ip pinned
+  Reboot.rebootIfBootCritical ip pinned
 
 -- | Sources legal once every tfstate has applied. All four kinds OK.
 resolvePostApply :: FilePath -> Source -> IO String

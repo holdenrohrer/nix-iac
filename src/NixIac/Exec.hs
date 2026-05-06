@@ -86,16 +86,10 @@ execEnv plan (cmd : args) = do
              : ("GIT_SSH_COMMAND", "ssh -F " <> sshConfig)
              : [ kv | kv <- parentEnv, fst kv `notElem` ["PATH", "GIT_SSH_COMMAND"] ]
 
-    -- Resolve `cmd` against the *parent* PATH so we don't accidentally
-    -- pick up our own shim (e.g. `infra exec ssh ...` should run `ssh`
-    -- via the shim — fine — but `infra exec which ssh` should report
-    -- the shim path, which it will via PATH lookup inside the shim env).
-    mPath <- findExecutable cmd
-    let (proc0, finalArgs) = case mPath of
-          Just p  -> (p,   args)
-          Nothing -> (cmd, args)  -- let exec fail loudly if not on PATH
-
-    (_, _, _, ph) <- createProcess (proc proc0 finalArgs)
+    -- Don't pre-resolve cmd against parent PATH — that would bypass our
+    -- shim dir for ssh/scp/sftp/rsync. Pass cmd bare; the child's execvp
+    -- uses the env we hand it, where binDir is first on PATH.
+    (_, _, _, ph) <- createProcess (proc cmd args)
                        { env       = Just env'
                        , std_in    = Inherit
                        , std_out   = Inherit

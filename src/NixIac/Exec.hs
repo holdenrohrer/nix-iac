@@ -24,13 +24,14 @@ module NixIac.Exec
   ) where
 
 import           Control.Exception        (bracket_)
+import           Control.Monad            (forM_)
 import           NixIac.Plan
 import qualified NixIac.Sops              as Sops
 import           NixIac.Run               (capture, die)
 import           System.Directory         (createDirectoryIfMissing,
                                             removePathForcibly,
                                             findExecutable)
-import           System.Environment       (lookupEnv, getEnvironment)
+import           System.Environment       (lookupEnv, getEnvironment, setEnv)
 import           System.Exit              (ExitCode (..), exitWith)
 import           System.FilePath          ((</>))
 import qualified System.IO                as IO
@@ -46,6 +47,17 @@ import           System.Process           (CreateProcess (..), StdStream (..),
 execEnv :: Plan -> [String] -> IO ()
 execEnv _    []           = die "exec: needs a command, e.g. `infra exec ssh <host> ...`"
 execEnv plan (cmd : args) = do
+  -- Resolve every deployEnv binding (sops/literal/cmd, *not* tfstate) and
+  -- export them, so tofu sees the same backend creds the deploy path uses.
+  -- Without this, S3-backed tfstates fail to read with "no credentials
+  -- found." TfOut sources are illegal here for the same reason as in
+  -- Orchestrator.resolvePreApply: if a deployEnv var came from tfstate,
+  -- you're in a chicken-and-egg with the very tofu call we're about to
+  -- make.
+  forM_ (planDeployEnv plan) $ \(k, src) -> do
+    v <- resolveDeployEnv k src
+    setEnv k v
+
   -- Stage everything under $XDG_RUNTIME_DIR (per-user tmpfs). Falls back
   -- to /tmp if the runtime dir is unset (rare; non-systemd hosts).
   base <- runtimeDirBase
@@ -179,6 +191,17 @@ resolveSrc root = \case
   Cmd c      -> capture "sh" ["-c", c]
   Sops f k   -> Sops.decryptKey f k
   TfOut s k  -> capture "tofu" ["-chdir=" <> (root </> s), "output", "-raw", k]
+
+-- | Resolve a Source from planDeployEnv. Refuses TfOut for the same reason
+-- as Orchestrator.resolvePreApply: tfstate-output values can't be read
+-- before tofu has the credentials we're trying to set up *here*.
+resolveDeployEnv :: String -> Source -> IO String
+resolveDeployEnv _ (Literal v)  = pure v
+resolveDeployEnv _ (Cmd c)      = capture "sh" ["-c", c]
+resolveDeployEnv _ (Sops f k)   = Sops.decryptKey f k
+resolveDeployEnv key (TfOut s _) = die
+  ("exec: deployEnv binding " <> key <> " references tfstate " <> s
+   <> "; only literal/cmd/sops are legal here")
 
 runtimeDirBase :: IO FilePath
 runtimeDirBase = do

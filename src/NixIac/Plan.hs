@@ -87,4 +87,14 @@ data HostCfg = HostCfg
     -- ^ Server's SSH host key (public). Used to populate the
     -- per-invocation known_hosts in 'Exec'.
   , hServerSecrets     :: [(String, Source)]
+  , hBootstrap         :: Bool
+    -- ^ When True, the pre-NixOS stages (Probe, Nixify/nixos-anywhere)
+    -- authenticate using the operator's ambient SSH configuration —
+    -- ssh-agent and @~/.ssh/config@ resolve identities — instead of
+    -- the tfstate-derived deploy key. Required for hosts whose only
+    -- pre-provisioned authorized_keys entry is an out-of-band operator
+    -- key (e.g. Hetzner Robot dedi ordering page); not needed for
+    -- providers with cloud-init style key injection (Hetzner Cloud).
+    -- Once nixos-anywhere plants the deploy key via extras, every
+    -- subsequent stage uses the standard tfstate auth.
   }

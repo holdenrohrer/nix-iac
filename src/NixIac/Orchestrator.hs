@@ -166,10 +166,17 @@ deployHost root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \
     (hName h <> "," <> ip <> " " <> hostKeyPub <> "\n")
   writeFile knownHostsTofu ""
 
-  let pinned = SshAuth { sshAuthKey = sshKey
+  let pinned = SshAuth { sshAuthKey = Just sshKey
                        , sshAuthKnownHosts = knownHostsPinned
                        , sshAuthStrict = Strict }
-      tofu   = SshAuth { sshAuthKey = sshKey
+      -- When the host opts into bootstrap mode (no cloud-init equivalent
+      -- to inject iac's deploy key), Probe + Nixify run with key=Nothing
+      -- so ssh falls through to the operator's agent / ~/.ssh. Once
+      -- nixos-anywhere plants the deploy key via extras, every later
+      -- stage uses `pinned` and is back on the reproducible path.
+      tofu   = SshAuth { sshAuthKey = if hBootstrap h
+                                        then Nothing
+                                        else Just sshKey
                        , sshAuthKnownHosts = knownHostsTofu
                        , sshAuthStrict = AcceptNew }
 

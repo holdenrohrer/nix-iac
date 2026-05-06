@@ -21,14 +21,18 @@ nixify :: String   -- ^ flake attribute name (`<flake>#<name>`)
        -> IO ()
 nixify name flake host auth extras =
   run "nixos-anywhere" $
-    [ "--flake", flake <> "#" <> name
-    , "-i", sshAuthKey auth
+    [ "--flake", flake <> "#" <> name ]
+    -- With a tfstate-pinned key we pass `-i` and `IdentitiesOnly=yes`.
+    -- In bootstrap mode (auth key = Nothing) we omit both and let
+    -- nixos-anywhere fall through to ssh-agent / ~/.ssh resolution.
+    <> maybe []
+             (\k -> [ "-i", k, "--ssh-option", "IdentitiesOnly=yes" ])
+             (sshAuthKey auth)
     -- Pass our private known_hosts through; without these flags
     -- nixos-anywhere writes to ~/.ssh/known_hosts via accept-new.
-    , "--ssh-option", "UserKnownHostsFile=" <> sshAuthKnownHosts auth
-    , "--ssh-option", "GlobalKnownHostsFile=/dev/null"
-    , "--ssh-option", "StrictHostKeyChecking=accept-new"
-    , "--ssh-option", "IdentitiesOnly=yes"
-    ]
+    <> [ "--ssh-option", "UserKnownHostsFile=" <> sshAuthKnownHosts auth
+       , "--ssh-option", "GlobalKnownHostsFile=/dev/null"
+       , "--ssh-option", "StrictHostKeyChecking=accept-new"
+       ]
     <> maybe [] (\e -> ["--extra-files", e]) extras
     <> [ "root@" <> host ]

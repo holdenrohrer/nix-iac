@@ -462,6 +462,10 @@ let
     in {
       type = "app";
       program = "${wrapped}/bin/infra";
+      # Expose the underlying derivation so consumers can include it as
+      # a Hydra job (or any other place that wants a derivation rather
+      # than the `nix run` indirection).
+      package = wrapped;
     };
 
 in {

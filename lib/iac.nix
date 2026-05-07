@@ -392,6 +392,10 @@ let
             in parseDeployFlags xs opts { doHostFilter = hs }
           parseDeployFlags ("--host":[]) _ =
             Left "error: --host requires an argument (host name)"
+          parseDeployFlags ("--rotate":name:xs) opts =
+            parseDeployFlags xs opts { doRotate = doRotate opts ++ [name] }
+          parseDeployFlags ("--rotate":[]) _ =
+            Left "error: --rotate requires an argument (output name)"
           parseDeployFlags (x:_) _ =
             Left ("error: unknown deploy flag: " <> x)
 
@@ -407,6 +411,13 @@ let
             , "                                        ssh (agent / ~/.ssh) on a host whose"
             , "                                        deploy key isn't installed yet — first"
             , "                                        install of a Hetzner Robot dedi etc."
+            , "                       --rotate NAME    drop terraform_data.NAME from state"
+            , "                                        BETWEEN warm-master and apply, so apply"
+            , "                                        regenerates its gen.once value. Use to"
+            , "                                        rotate ssh / host / age / password creds"
+            , "                                        without locking the deploy out: the"
+            , "                                        warmed master bridges the discontinuity."
+            , "                                        Repeatable."
             , "  exec <cmd> [...]   Run <cmd> with ssh/scp/sftp/rsync wrapped to"
             , "                     resolve every host by name (HostName, IdentityFile,"
             , "                     UserKnownHostsFile preconfigured from tfstate)."

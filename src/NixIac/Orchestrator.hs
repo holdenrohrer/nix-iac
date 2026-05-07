@@ -58,6 +58,16 @@ data DeployOpts = DeployOpts
     -- via extras, the flag is no longer needed and would be a no-op.
     -- Per-deploy-run rather than per-host so it doesn't ossify into
     -- a permanent declaration of a one-time concern.
+  , doRotate     :: [String]
+    -- ^ Output names whose backing 'gen.once' values should be
+    -- regenerated this run. Implementation: between phase 2
+    -- (warmMaster, which still sees the OLD pinned values and opens
+    -- a TCP through them) and phase 3 (apply), each named
+    -- @terraform_data.<name>@ is dropped from state via
+    -- @tofu state rm@. Apply then has nothing to read for those names
+    -- and runs gen.once afresh, pinning a new value. Phase 4's
+    -- deployHost ssh's attach to the warmed master, so even when the
+    -- rotated value is the deploy key itself the host can be reached.
   }
 
 defaultDeployOpts :: DeployOpts
@@ -65,6 +75,7 @@ defaultDeployOpts = DeployOpts
   { doHostFilter = Nothing
   , doReinstall  = False
   , doBootstrap  = False
+  , doRotate     = []
   }
 
 -- | Entry point. Drives every tfstate to convergence, then deploys the
@@ -101,9 +112,31 @@ orchestrate opts p = withSystemTempDirectory "nix-iac-deploy" $ \deployTmp -> do
   -- pre-bootstrap) silently skip warming and use the regular flow.
   forM_ selected $ \h -> warmMaster (planStateDir p) deployTmp h
 
-  -- Phase 3: apply each tfstate. May rewrite ssh_priv / host_priv if the
-  -- caller dropped them from state (rotation). The masters from phase 2
-  -- keep working through this.
+  -- Phase 2.5: rotate. After warming masters but BEFORE apply, drop
+  -- the named @terraform_data.<output>@ resources from every tfstate
+  -- they appear in. Apply then sees empty state for those slots and
+  -- runs the corresponding gen.once afresh, pinning new values. The
+  -- masters from phase 2 are alive on the OLD identity, so phase 4's
+  -- ssh's attach without re-auth even when one of the rotated values
+  -- is the deploy key itself.
+  --
+  -- @tofu state rm@ exits non-zero when the resource isn't in this
+  -- particular state — we ignore that and try the next state. Each
+  -- output name is expected to live in exactly one state.
+  when (not (null (doRotate opts))) $
+    forM_ (doRotate opts) $ \name ->
+      forM_ (planTfStates p) $ \s -> do
+        let dir = planStateDir p </> tfsName s
+        (ec, _) <- captureExit "tofu"
+          [ "-chdir=" <> dir, "state", "rm", "terraform_data." <> name ]
+        case ec of
+          ExitSuccess   -> IO.hPutStrLn IO.stderr
+            ("==> rotate: " <> name <> " (in " <> tfsName s <> ")")
+          ExitFailure _ -> pure ()
+
+  -- Phase 3: apply each tfstate. May rewrite gen.once values for
+  -- anything dropped in phase 2.5. The masters from phase 2 keep
+  -- working through this.
   forM_ (planTfStates p) $ \s -> do
     IO.hPutStrLn IO.stderr ("==> apply: " <> tfsName s)
     applyStateAfterInit (planStateDir p) s

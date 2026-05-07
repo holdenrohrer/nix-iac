@@ -370,10 +370,15 @@ deployHost opts root flakeRef deployTmp h = withSystemTempDirectory ("nix-iac-" 
       tofu   = SshAuth { sshAuthKey = Just sshKey
                        , sshAuthKnownHosts = knownHostsTofu
                        , sshAuthStrict = AcceptNew
-                       , sshAuthControlPath = Nothing
-                       -- ^ Probe/Nixify are exploratory and the host key
-                       -- they accept may not be the final pinned one;
-                       -- don't share their TCP with strict-mode peers.
+                       , sshAuthControlPath = Just ctl
+                       -- ^ Attach to the warmed master if one is open
+                       -- (already-NixOS path with a rotation in flight:
+                       -- the master is on OLD identity but the materialized
+                       -- @sshKey@ is the NEW priv, so a fresh probe auth
+                       -- would fail against forge's still-OLD authorized_keys).
+                       -- ControlMaster=auto means: attach if exists, else
+                       -- create — fresh-install hosts (no master) just
+                       -- start a new connection like before.
                        }
       -- 'bootstrapAuth' falls back to the operator's ambient SSH config
       -- (agent / ~/.ssh). Used only as a probe/nixify fallback for hosts

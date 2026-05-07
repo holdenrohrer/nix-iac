@@ -113,28 +113,28 @@ orchestrate opts p = withSystemTempDirectory "nix-iac-deploy" $ \deployTmp -> do
   forM_ selected $ \h -> warmMaster (planStateDir p) deployTmp h
 
   -- Phase 2.5: rotate. After warming masters but BEFORE apply, drop
-  -- BOTH the @terraform_data.<output>@ resource AND the @output.<name>@
-  -- entry from every tfstate they appear in. Removing only the
-  -- resource is not enough — @output@ entries in tfstate retain their
-  -- last-computed value, and 'readPinnedOutputs' (which seeds
-  -- 'resolveInState's cache for var-feeding) reads outputs, not
-  -- resources. Without removing the output too, apply re-feeds the
-  -- old value into 'TF_VAR_<name>' and the recreated resource ends
-  -- up with the SAME value as before. The bug looks like a successful
-  -- rotation in the orchestrator log but produces no real change.
+  -- the named @terraform_data.<name>@ resources from every tfstate.
+  -- Apply will re-CREATE them (not update — so lifecycle.ignore_changes
+  -- on input doesn't apply); the new resource takes its input from
+  -- @var.<name>@, fed by the orchestrator from gen.once via
+  -- 'resolveInState'. The companion fix in 'applyStateAfterInit'
+  -- empties the resolve-cache for rotated names so the var-feed runs
+  -- gen.once instead of returning the stale output value.
   --
-  -- @tofu state rm@ exits non-zero when the entry isn't in this
+  -- (Tofu doesn't support @state rm output.<name>@, so we can't drop
+  -- the output entry directly — outputs are auto-managed from config
+  -- and recomputed at the end of apply from the new resource attr.)
+  --
+  -- @tofu state rm@ exits non-zero when the resource isn't in this
   -- particular state — we ignore that and try the next state. Each
   -- output name is expected to live in exactly one state.
   when (not (null (doRotate opts))) $
     forM_ (doRotate opts) $ \name ->
       forM_ (planTfStates p) $ \s -> do
         let dir = planStateDir p </> tfsName s
-        (rcRes, _) <- captureExit "tofu"
+        (rc, _) <- captureExit "tofu"
           [ "-chdir=" <> dir, "state", "rm", "terraform_data." <> name ]
-        _          <- captureExit "tofu"
-          [ "-chdir=" <> dir, "state", "rm", "output." <> name ]
-        case rcRes of
+        case rc of
           ExitSuccess   -> IO.hPutStrLn IO.stderr
             ("==> rotate: " <> name <> " (in " <> tfsName s <> ")")
           ExitFailure _ -> pure ()
@@ -144,7 +144,7 @@ orchestrate opts p = withSystemTempDirectory "nix-iac-deploy" $ \deployTmp -> do
   -- working through this.
   forM_ (planTfStates p) $ \s -> do
     IO.hPutStrLn IO.stderr ("==> apply: " <> tfsName s)
-    applyStateAfterInit (planStateDir p) s
+    applyStateAfterInit (planStateDir p) (doRotate opts) s
 
   -- Phase 4: per-host deploy. Uses the warmed master if present.
   forM_ selected $ \h -> do
@@ -180,15 +180,25 @@ initStateDir root s = do
   copyFile (tfsConfigFile s) (dir </> "config.tf.json")
   run "tofu" ["-chdir=" <> dir, "init", "-input=false", "-reconfigure"]
 
-applyStateAfterInit :: FilePath -> TfStateCfg -> IO ()
-applyStateAfterInit root s = do
+applyStateAfterInit :: FilePath -> [String] -> TfStateCfg -> IO ()
+applyStateAfterInit root rotate s = do
   let dir = root </> tfsName s
 
   -- Read all already-pinned outputs from this state in one shot; tofu
   -- output -json on an empty state returns "{}" with exit 0 — `-raw` per
   -- key returns exit 0 with the warning text on stdout, which is unsafe
   -- to interpret as the value.
-  pinned <- readPinnedOutputs dir
+  --
+  -- Drop entries for names the operator asked to rotate. tfstate
+  -- outputs retain their last-computed value across a 'tofu state rm'
+  -- of their backing resource, and 'tofu state rm' on @output.<name>@
+  -- isn't supported (Tofu rejects it as not-a-specific-instance). So
+  -- we surgically empty the in-memory cache for rotated keys; that
+  -- forces resolveInState to fall through to materializeGenerator,
+  -- which runs gen.once afresh and produces a NEW value to feed
+  -- @TF_VAR_<name>@.
+  rawPinned <- readPinnedOutputs dir
+  let pinned = foldr Map.delete rawPinned rotate
 
   let genMap = Map.fromList [ (gsOutputName gs, gsGenerator gs) | gs <- tfsGenerators s ]
   cache <- newIORef (pinned :: Map.Map String String)

@@ -202,16 +202,21 @@ deployHost reinstall root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hN
   let pinned = SshAuth { sshAuthKey = Just sshKey
                        , sshAuthKnownHosts = knownHostsPinned
                        , sshAuthStrict = Strict }
-      -- When the host opts into bootstrap mode (no cloud-init equivalent
-      -- to inject iac's deploy key), Probe + Nixify run with key=Nothing
-      -- so ssh falls through to the operator's agent / ~/.ssh. Once
-      -- nixos-anywhere plants the deploy key via extras, every later
-      -- stage uses `pinned` and is back on the reproducible path.
-      tofu   = SshAuth { sshAuthKey = if hBootstrap h
-                                        then Nothing
-                                        else Just sshKey
+      -- 'tofu' is the AcceptNew-known_hosts variant of pinned. Used for
+      -- Probe (host key may not match yet) and Nixify (the install
+      -- itself is what plants the pinned host key).
+      tofu   = SshAuth { sshAuthKey = Just sshKey
                        , sshAuthKnownHosts = knownHostsTofu
                        , sshAuthStrict = AcceptNew }
+      -- 'bootstrapAuth' falls back to the operator's ambient SSH config
+      -- (agent / ~/.ssh). Used only as a probe/nixify fallback for hosts
+      -- that opted in via 'bootstrap = true' AND haven't yet had iac's
+      -- deploy key installed (ie a fresh dedi). Once the install plants
+      -- the deploy key via extras, ambient SSH is unnecessary and we
+      -- never fall back to it again.
+      bootstrapAuth = SshAuth { sshAuthKey = Nothing
+                              , sshAuthKnownHosts = knownHostsTofu
+                              , sshAuthStrict = AcceptNew }
 
   blobLines <- mapM (\(k, src) -> do
                        v <- resolvePostApply root src
@@ -252,7 +257,21 @@ deployHost reinstall root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hN
   -- NixOS box, force the bootstrap path so nixos-anywhere reformats per
   -- the current disko config. The probe still gates on SSH reachability
   -- — a wedged host won't get reformatted.
-  probe <- Probe.probeNixos ip tofu
+  --
+  -- For 'bootstrap = True' hosts, the deploy key may not be installed
+  -- yet (fresh dedi). We try iac's key first; if SSH fails AND we have
+  -- bootstrapAuth available, retry once with ambient ssh. After
+  -- nixos-anywhere plants the deploy key, the ambient fallback is no
+  -- longer needed and won't be exercised on subsequent runs.
+  let probeOnce = Probe.probeNixos ip
+  (probe, nixifyAuth) <- do
+    first <- probeOnce tofu
+    case (first, hBootstrap h) of
+      (Probe.SshFailed _, True) -> do
+        -- Fresh dedi: deploy key not yet installed, retry with ambient.
+        r <- probeOnce bootstrapAuth
+        pure (r, bootstrapAuth)
+      _ -> pure (first, tofu)
   case probe of
     Probe.SshFailed n ->
       die ("probe: ssh to " <> ip <> " failed (exit " <> show n
@@ -276,7 +295,7 @@ deployHost reinstall root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hN
       -- Nixify is pre-bootstrap → AcceptNew. After it completes the box
       -- has the tfstate-pinned host key from extras, so subsequent ops
       -- (Deploy/Reboot below) verify strictly.
-      Nixify.nixify (hName h) flakeRef ip tofu (Just extras)
+      Nixify.nixify (hName h) flakeRef ip nixifyAuth (Just extras)
       -- nixos-anywhere returns the moment it triggers the post-install
       -- reboot; the new sshd hasn't bound yet. Wait for it before any
       -- subsequent SSH-driven step (Deploy/Reboot) so we don't race

@@ -34,3 +34,4 @@ library
     , NixIac.Run
     , NixIac.Sops
     , NixIac.SshOpts
+    , NixIac.WaitSsh

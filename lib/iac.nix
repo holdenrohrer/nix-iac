@@ -374,8 +374,10 @@ let
               }
         args <- getArgs
         case args of
-          []                  -> deployAll plan
-          ("deploy":_)        -> deployAll plan
+          []                  -> deployWith plan defaultDeployOpts
+          ("deploy":rest)     -> case parseDeployFlags rest defaultDeployOpts of
+            Right opts        -> deployWith plan opts
+            Left  err         -> hPutStrLn stderr err >> exitWith (ExitFailure 64)
           ("exec":rest)       -> Exec.execEnv plan rest
           ("help":_)          -> usage >> exitWith (ExitSuccess)
           ("--help":_)        -> usage >> exitWith (ExitSuccess)
@@ -385,13 +387,34 @@ let
             usage
             exitWith (ExitFailure 64)
         where
-          deployAll p = do
+          deployWith p opts = do
             hPutStrLn stderr ("==> nix-iac: stateDir = " <> planStateDir p)
-            orchestrate p
+            orchestrate opts p
+
+          -- Tiny ad-hoc flag parser for the deploy subcommand. We
+          -- accumulate --host into a list (so multiple --host flags work)
+          -- and treat --reinstall as a boolean toggle.
+          parseDeployFlags [] opts = Right opts
+          parseDeployFlags ("--reinstall":xs) opts =
+            parseDeployFlags xs opts { doReinstall = True }
+          parseDeployFlags ("--host":name:xs) opts =
+            let hs = case doHostFilter opts of
+                      Just acc -> Just (acc ++ [name])
+                      Nothing  -> Just [name]
+            in parseDeployFlags xs opts { doHostFilter = hs }
+          parseDeployFlags ("--host":[]) _ =
+            Left "error: --host requires an argument (host name)"
+          parseDeployFlags (x:_) _ =
+            Left ("error: unknown deploy flag: " <> x)
+
           usage = mapM_ (hPutStrLn stderr)
             [ "usage: infra <subcommand> [args...]"
             , ""
-            , "  deploy             Apply tfstates and deploy every host (default)."
+            , "  deploy [opts]      Apply tfstates and deploy hosts. Options:"
+            , "                       --host NAME      only deploy NAME (repeatable)."
+            , "                       --reinstall      force nixos-anywhere even on a"
+            , "                                        host that's already NixOS, e.g. to"
+            , "                                        reformat after a disko-config change."
             , "  exec <cmd> [...]   Run <cmd> with ssh/scp/sftp/rsync wrapped to"
             , "                     resolve every host by name (HostName, IdentityFile,"
             , "                     UserKnownHostsFile preconfigured from tfstate)."

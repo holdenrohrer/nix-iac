@@ -49,10 +49,23 @@ data DeployOpts = DeployOpts
     -- disko config has changed (e.g. moving from a single-disk layout
     -- to a multi-disk RAID0). The probe still gates on SSH reachability,
     -- so an unreachable host still aborts. The host's data is wiped.
+  , doBootstrap  :: Bool
+    -- ^ When 'True', the pre-NixOS stages (Probe, Nixify) may fall back
+    -- to the operator's ambient SSH configuration if the iac deploy
+    -- key fails. Required only for the very first install of a host
+    -- that wasn't provisioned with iac's key at boot (Hetzner Robot
+    -- dedi via order page). Once nixos-anywhere plants the deploy key
+    -- via extras, the flag is no longer needed and would be a no-op.
+    -- Per-deploy-run rather than per-host so it doesn't ossify into
+    -- a permanent declaration of a one-time concern.
   }
 
 defaultDeployOpts :: DeployOpts
-defaultDeployOpts = DeployOpts { doHostFilter = Nothing, doReinstall = False }
+defaultDeployOpts = DeployOpts
+  { doHostFilter = Nothing
+  , doReinstall  = False
+  , doBootstrap  = False
+  }
 
 -- | Entry point. Drives every tfstate to convergence, then deploys the
 -- selected hosts. See module header for invariants.
@@ -78,7 +91,7 @@ orchestrate opts p = do
 
   forM_ selected $ \h -> do
     IO.hPutStrLn IO.stderr ("==> deploy: " <> hName h)
-    deployHost (doReinstall opts) (planStateDir p) (planFlakeRef p) h
+    deployHost opts (planStateDir p) (planFlakeRef p) h
 
 -- ------------------------------------------------------------------ deployEnv
 
@@ -171,8 +184,10 @@ materializeGenerator resolveSrc g = case g of
 
 -- ------------------------------------------------------------------ per-host
 
-deployHost :: Bool -> FilePath -> String -> HostCfg -> IO ()
-deployHost reinstall root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \tmp -> do
+deployHost :: DeployOpts -> FilePath -> String -> HostCfg -> IO ()
+deployHost opts root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \tmp -> do
+  let reinstall = doReinstall opts
+      bootstrap = doBootstrap opts
   ip          <- resolvePostApply root (hIp h)
   agePub      <- resolvePostApply root (hAgePub h)
   agePriv     <- resolvePostApply root (hAgePriv h)
@@ -266,7 +281,7 @@ deployHost reinstall root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hN
   let probeOnce = Probe.probeNixos ip
   (probe, nixifyAuth) <- do
     first <- probeOnce tofu
-    case (first, hBootstrap h) of
+    case (first, bootstrap) of
       (Probe.SshFailed _, True) -> do
         -- Fresh dedi: deploy key not yet installed, retry with ambient.
         r <- probeOnce bootstrapAuth

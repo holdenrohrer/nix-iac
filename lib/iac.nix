@@ -123,22 +123,9 @@ let
 
   # ------------------------------------------------------------------- host
 
-  # `bootstrap`: when true, the Probe + Nixify (nixos-anywhere) stages
-  # authenticate using the operator's ambient SSH configuration —
-  # ssh-agent and `~/.ssh/config` are consulted as ssh normally does —
-  # instead of iac's tfstate-derived deploy key. Required for hosts
-  # whose only pre-provisioned authorized_keys entry is an out-of-band
-  # operator key (e.g. Hetzner Robot dedi ordering page); not needed
-  # for providers with cloud-init style key injection (Hetzner Cloud
-  # via `hcloud_ssh_key`). After nixos-anywhere plants the iac deploy
-  # key via extras, every subsequent stage reverts to the standard
-  # tfstate auth — so this exception is scoped to bootstrap and the
-  # ongoing-deploy path remains fully reproducible.
-  host = { name, tfState, ipOutput, serverSecrets ? {}, bootstrap ? false }:
+  host = { name, tfState, ipOutput, serverSecrets ? {} }:
     assert (isTfState tfState) || throw "iac.host: tfState must be from iac.tfState";
     assert (isSource ipOutput) || throw "iac.host: ipOutput must be a Source";
-    assert (builtins.isBool bootstrap)
-        || throw "iac.host: bootstrap must be a Bool (got ${builtins.typeOf bootstrap})";
     let
       sshPriv = tfState.output "${name}_ssh_priv" (gen.once ''
         f=$(mktemp -u)
@@ -169,7 +156,7 @@ let
       serverSecretsPath = "/var/lib/sops-nix/${name}-secrets.yaml";
 
       hostRec = tagHost {
-        inherit name tfState serverSecrets serverSecretsPath bootstrap;
+        inherit name tfState serverSecrets serverSecretsPath;
         ip = ipOutput;
         inherit sshPriv sshPub agePriv agePub hostKeyPriv hostKeyPub;
 
@@ -348,7 +335,6 @@ let
            + ", hHostKeyPriv = " + sourceExpr h.hostKeyPriv
            + ", hHostKeyPub = "  + sourceExpr h.hostKeyPub
            + ", hServerSecrets = " + kv h.serverSecrets
-           + ", hBootstrap = " + (if h.bootstrap then "True" else "False")
            + " }";
     in ''
       {-# LANGUAGE OverloadedStrings #-}
@@ -397,6 +383,8 @@ let
           parseDeployFlags [] opts = Right opts
           parseDeployFlags ("--reinstall":xs) opts =
             parseDeployFlags xs opts { doReinstall = True }
+          parseDeployFlags ("--bootstrap":xs) opts =
+            parseDeployFlags xs opts { doBootstrap = True }
           parseDeployFlags ("--host":name:xs) opts =
             let hs = case doHostFilter opts of
                       Just acc -> Just (acc ++ [name])
@@ -415,6 +403,10 @@ let
             , "                       --reinstall      force nixos-anywhere even on a"
             , "                                        host that's already NixOS, e.g. to"
             , "                                        reformat after a disko-config change."
+            , "                       --bootstrap      let Probe + Nixify fall back to ambient"
+            , "                                        ssh (agent / ~/.ssh) on a host whose"
+            , "                                        deploy key isn't installed yet — first"
+            , "                                        install of a Hetzner Robot dedi etc."
             , "  exec <cmd> [...]   Run <cmd> with ssh/scp/sftp/rsync wrapped to"
             , "                     resolve every host by name (HostName, IdentityFile,"
             , "                     UserKnownHostsFile preconfigured from tfstate)."

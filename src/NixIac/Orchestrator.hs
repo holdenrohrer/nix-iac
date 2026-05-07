@@ -70,13 +70,9 @@ defaultDeployOpts = DeployOpts
 -- | Entry point. Drives every tfstate to convergence, then deploys the
 -- selected hosts. See module header for invariants.
 orchestrate :: DeployOpts -> Plan -> IO ()
-orchestrate opts p = do
+orchestrate opts p = withSystemTempDirectory "nix-iac-deploy" $ \deployTmp -> do
   IO.hPutStrLn IO.stderr "==> orchestrate: deployEnv"
   setDeployEnv (planDeployEnv p)
-
-  forM_ (planTfStates p) $ \s -> do
-    IO.hPutStrLn IO.stderr ("==> tfstate: " <> tfsName s)
-    applyState (planStateDir p) s
 
   let selected = case doHostFilter opts of
         Nothing    -> planHosts p
@@ -89,9 +85,33 @@ orchestrate opts p = do
                           <> " (available: " <> unwords present <> ")")
              else filter (\h -> hName h `elem` want) (planHosts p)
 
+  -- Phase 1: init every tfstate so we can read its current pinned values
+  -- before any apply rewrites them. Idempotent — apply re-inits anyway.
+  forM_ (planTfStates p) $ \s -> do
+    IO.hPutStrLn IO.stderr ("==> init: " <> tfsName s)
+    initStateDir (planStateDir p) s
+
+  -- Phase 2: warm an SSH ControlMaster per host using PRE-apply
+  -- credentials. Each master's TCP survives @tofu apply@ rewriting
+  -- tfstate; subsequent ssh's that share the ControlPath attach to it
+  -- without re-auth, which is what makes mid-deploy ssh-key / host-key
+  -- rotation safe (new client priv vs. old authorized_keys, new pinned
+  -- host pub vs. old served host key — the master bridges both
+  -- discontinuities). Hosts without already-pinned creds (fresh dedi
+  -- pre-bootstrap) silently skip warming and use the regular flow.
+  forM_ selected $ \h -> warmMaster (planStateDir p) deployTmp h
+
+  -- Phase 3: apply each tfstate. May rewrite ssh_priv / host_priv if the
+  -- caller dropped them from state (rotation). The masters from phase 2
+  -- keep working through this.
+  forM_ (planTfStates p) $ \s -> do
+    IO.hPutStrLn IO.stderr ("==> apply: " <> tfsName s)
+    applyStateAfterInit (planStateDir p) s
+
+  -- Phase 4: per-host deploy. Uses the warmed master if present.
   forM_ selected $ \h -> do
     IO.hPutStrLn IO.stderr ("==> deploy: " <> hName h)
-    deployHost opts (planStateDir p) (planFlakeRef p) h
+    deployHost opts (planStateDir p) (planFlakeRef p) deployTmp h
 
 -- ------------------------------------------------------------------ deployEnv
 
@@ -111,12 +131,20 @@ resolvePreApply = \case
 
 -- ----------------------------------------------------------- per-tfstate apply
 
-applyState :: FilePath -> TfStateCfg -> IO ()
-applyState root s = do
+-- | Materialize a tfstate's working directory and run @tofu init@. Split
+-- out from 'applyStateAfterInit' so callers (the warm-master phase) can
+-- read pinned outputs from the BACKEND before any apply rewrites them.
+-- Idempotent — running it twice is fine.
+initStateDir :: FilePath -> TfStateCfg -> IO ()
+initStateDir root s = do
   let dir = root </> tfsName s
   createDirectoryIfMissing True dir
   copyFile (tfsConfigFile s) (dir </> "config.tf.json")
   run "tofu" ["-chdir=" <> dir, "init", "-input=false", "-reconfigure"]
+
+applyStateAfterInit :: FilePath -> TfStateCfg -> IO ()
+applyStateAfterInit root s = do
+  let dir = root </> tfsName s
 
   -- Read all already-pinned outputs from this state in one shot; tofu
   -- output -json on an empty state returns "{}" with exit 0 — `-raw` per
@@ -182,12 +210,78 @@ materializeGenerator resolveSrc g = case g of
     v <- resolveSrc src
     capture "sh" ["-c", "printf '%s\\n' " <> shellSingle v <> " | " <> c]
 
+-- ------------------------------------- per-host SSH ControlMaster warm-up
+
+-- | Path to the per-host ssh ControlMaster socket. Lives under the
+-- shared deploy tmpdir so its lifetime exactly matches one
+-- 'orchestrate' call. Path length matters here — Linux unix socket
+-- paths are capped at 108 bytes; the deployTmp is short ("/tmp/...")
+-- and the socket name is bounded.
+controlPathFor :: FilePath -> HostCfg -> FilePath
+controlPathFor deployTmp h = deployTmp </> ("cm-" <> hName h <> ".sock")
+
+-- | Open an ssh ControlMaster against the host using its CURRENTLY-pinned
+-- credentials. Run *before* @tofu apply@ so that even if apply rewrites
+-- @<host>_ssh_priv@ / @<host>_host_priv@, the master's TCP keeps working.
+-- Best-effort: if the host has no pinned creds yet (fresh dedi) or is
+-- unreachable, log and move on — the regular probe/bootstrap path still
+-- handles these cases.
+warmMaster :: FilePath -> FilePath -> HostCfg -> IO ()
+warmMaster root deployTmp h = do
+  let ctl = controlPathFor deployTmp h
+  -- Resolve pre-apply: this reads from already-init'd state via tofu
+  -- output. If the value isn't pinned (first install), tofuOutAt errors
+  -- and we skip warming. We catch via @captureExit@-style idiom below.
+  ePriv     <- tryResolve (hSshPriv h)
+  eHostPub  <- tryResolve (hHostKeyPub h)
+  eIp       <- tryResolve (hIp h)
+  case (ePriv, eHostPub, eIp) of
+    (Just sshPriv, Just hostPub, Just ip) -> do
+      let keyFile  = deployTmp </> ("warm-" <> hName h <> ".key")
+          khFile   = deployTmp </> ("warm-" <> hName h <> ".kh")
+      writeFile keyFile (sshPriv <> "\n"); setFileMode keyFile 0o600
+      writeFile khFile (hName h <> "," <> ip <> " " <> hostPub <> "\n")
+      -- -M: become master; -N: no command; -f: background after auth.
+      -- ControlPersist=600 keeps it alive even if -f's child exits.
+      (ec, _) <- captureExit "ssh"
+        [ "-M", "-N", "-f"
+        , "-i", keyFile, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"
+        , "-o", "UserKnownHostsFile=" <> khFile
+        , "-o", "GlobalKnownHostsFile=/dev/null"
+        , "-o", "StrictHostKeyChecking=yes"
+        , "-o", "ConnectTimeout=10"
+        , "-o", "ControlPath=" <> ctl
+        , "-o", "ControlPersist=600"
+        , "root@" <> ip
+        ]
+      case ec of
+        ExitSuccess   -> IO.hPutStrLn IO.stderr
+          ("==> warm-master: " <> hName h <> " ok (" <> ctl <> ")")
+        ExitFailure n -> IO.hPutStrLn IO.stderr
+          ("==> warm-master: " <> hName h <> " skipped (ssh exit " <> show n
+            <> "); regular flow will handle.")
+    _ -> IO.hPutStrLn IO.stderr
+      ("==> warm-master: " <> hName h
+       <> " skipped (creds not pinned yet, fresh install).")
+  where
+    -- Return Nothing instead of dying when a TfOut isn't pinned in the
+    -- backend yet (first install). Reads via @output -json@ rather than
+    -- @-raw@ because the latter emits a warning to stdout on missing
+    -- keys (with exit 0), which is unsafe to interpret as a value.
+    tryResolve :: Source -> IO (Maybe String)
+    tryResolve = \case
+      Literal v -> pure (Just v)
+      Cmd c     -> Just <$> capture "sh" ["-c", c]
+      Sops f k  -> Just <$> Sops.decryptKey f k
+      TfOut st k -> Map.lookup k <$> readPinnedOutputs (root </> st)
+
 -- ------------------------------------------------------------------ per-host
 
-deployHost :: DeployOpts -> FilePath -> String -> HostCfg -> IO ()
-deployHost opts root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \tmp -> do
+deployHost :: DeployOpts -> FilePath -> String -> FilePath -> HostCfg -> IO ()
+deployHost opts root flakeRef deployTmp h = withSystemTempDirectory ("nix-iac-" <> hName h) $ \tmp -> do
   let reinstall = doReinstall opts
       bootstrap = doBootstrap opts
+      ctl       = controlPathFor deployTmp h
   ip          <- resolvePostApply root (hIp h)
   agePub      <- resolvePostApply root (hAgePub h)
   agePriv     <- resolvePostApply root (hAgePriv h)
@@ -216,13 +310,23 @@ deployHost opts root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h
 
   let pinned = SshAuth { sshAuthKey = Just sshKey
                        , sshAuthKnownHosts = knownHostsPinned
-                       , sshAuthStrict = Strict }
+                       , sshAuthStrict = Strict
+                       , sshAuthControlPath = Just ctl
+                       -- ^ All post-bootstrap traffic shares this master.
+                       -- Warmed pre-apply by 'warmMaster' so mid-deploy
+                       -- ssh-key / host-key rotation doesn't lock us out.
+                       }
       -- 'tofu' is the AcceptNew-known_hosts variant of pinned. Used for
       -- Probe (host key may not match yet) and Nixify (the install
       -- itself is what plants the pinned host key).
       tofu   = SshAuth { sshAuthKey = Just sshKey
                        , sshAuthKnownHosts = knownHostsTofu
-                       , sshAuthStrict = AcceptNew }
+                       , sshAuthStrict = AcceptNew
+                       , sshAuthControlPath = Nothing
+                       -- ^ Probe/Nixify are exploratory and the host key
+                       -- they accept may not be the final pinned one;
+                       -- don't share their TCP with strict-mode peers.
+                       }
       -- 'bootstrapAuth' falls back to the operator's ambient SSH config
       -- (agent / ~/.ssh). Used only as a probe/nixify fallback for hosts
       -- that opted in via 'bootstrap = true' AND haven't yet had iac's
@@ -231,7 +335,9 @@ deployHost opts root flakeRef h = withSystemTempDirectory ("nix-iac-" <> hName h
       -- never fall back to it again.
       bootstrapAuth = SshAuth { sshAuthKey = Nothing
                               , sshAuthKnownHosts = knownHostsTofu
-                              , sshAuthStrict = AcceptNew }
+                              , sshAuthStrict = AcceptNew
+                              , sshAuthControlPath = Nothing
+                              }
 
   blobLines <- mapM (\(k, src) -> do
                        v <- resolvePostApply root src

@@ -47,6 +47,16 @@ data SshAuth = SshAuth
   , sshAuthKnownHosts :: FilePath
     -- ^ Per-deploy known_hosts file under the tmpdir.
   , sshAuthStrict     :: StrictMode
+  , sshAuthControlPath :: Maybe FilePath
+    -- ^ When 'Just', enables ssh ControlMaster=auto pointing at this
+    -- socket path. Every ssh in this run that gets the same path
+    -- attaches to the existing master, skipping TCP+auth. The point
+    -- is mid-deploy SSH-key / host-key rotation: a master warmed BEFORE
+    -- @tofu apply@ rewrites tfstate keeps its TCP across the rewrite,
+    -- so subsequent ssh's never see the discontinuity. Without this,
+    -- rotating @<host>_ssh_priv@ or @<host>_host_priv@ deadlocks the
+    -- next deploy (new client priv vs. old @authorized_keys@; new
+    -- pinned host pub vs. old key still served by sshd).
   }
   deriving (Eq, Show)
 
@@ -68,7 +78,12 @@ sshArgs SshAuth{..} =
       Strict    -> "yes"
       AcceptNew -> "accept-new"
   , "-o", "ConnectTimeout=10"
-  ]
+  ] ++
+  (case sshAuthControlPath of
+     Just p  -> [ "-o", "ControlMaster=auto"
+                , "-o", "ControlPath=" <> p
+                , "-o", "ControlPersist=600" ]
+     Nothing -> [])
 
 -- | Single shell-quoted string of the same options, for tools that take
 -- a single @--ssh-opts@ argument (deploy-rs).

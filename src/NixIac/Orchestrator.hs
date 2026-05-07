@@ -113,23 +113,28 @@ orchestrate opts p = withSystemTempDirectory "nix-iac-deploy" $ \deployTmp -> do
   forM_ selected $ \h -> warmMaster (planStateDir p) deployTmp h
 
   -- Phase 2.5: rotate. After warming masters but BEFORE apply, drop
-  -- the named @terraform_data.<output>@ resources from every tfstate
-  -- they appear in. Apply then sees empty state for those slots and
-  -- runs the corresponding gen.once afresh, pinning new values. The
-  -- masters from phase 2 are alive on the OLD identity, so phase 4's
-  -- ssh's attach without re-auth even when one of the rotated values
-  -- is the deploy key itself.
+  -- BOTH the @terraform_data.<output>@ resource AND the @output.<name>@
+  -- entry from every tfstate they appear in. Removing only the
+  -- resource is not enough — @output@ entries in tfstate retain their
+  -- last-computed value, and 'readPinnedOutputs' (which seeds
+  -- 'resolveInState's cache for var-feeding) reads outputs, not
+  -- resources. Without removing the output too, apply re-feeds the
+  -- old value into 'TF_VAR_<name>' and the recreated resource ends
+  -- up with the SAME value as before. The bug looks like a successful
+  -- rotation in the orchestrator log but produces no real change.
   --
-  -- @tofu state rm@ exits non-zero when the resource isn't in this
+  -- @tofu state rm@ exits non-zero when the entry isn't in this
   -- particular state — we ignore that and try the next state. Each
   -- output name is expected to live in exactly one state.
   when (not (null (doRotate opts))) $
     forM_ (doRotate opts) $ \name ->
       forM_ (planTfStates p) $ \s -> do
         let dir = planStateDir p </> tfsName s
-        (ec, _) <- captureExit "tofu"
+        (rcRes, _) <- captureExit "tofu"
           [ "-chdir=" <> dir, "state", "rm", "terraform_data." <> name ]
-        case ec of
+        _          <- captureExit "tofu"
+          [ "-chdir=" <> dir, "state", "rm", "output." <> name ]
+        case rcRes of
           ExitSuccess   -> IO.hPutStrLn IO.stderr
             ("==> rotate: " <> name <> " (in " <> tfsName s <> ")")
           ExitFailure _ -> pure ()
@@ -431,16 +436,51 @@ deployHost opts root flakeRef deployTmp h = withSystemTempDirectory ("nix-iac-" 
       die ("probe: ssh to " <> ip <> " failed (exit " <> show n
            <> "); refusing to bootstrap a host we can't reach")
     Probe.IsNixOS | not reinstall -> do
-      IO.hPutStrLn IO.stderr ("==> " <> hName h <> ": already NixOS, shipping new sops blob")
-      run "scp" $
-        sshArgs pinned ++
-        [ blobOut
-        , "root@" <> ip <> ":" <> hServerSecretsPath h <> ".new"
-        ]
-      run "ssh" $
-        sshArgs pinned ++
+      IO.hPutStrLn IO.stderr ("==> " <> hName h <> ": already NixOS, shipping runtime files")
+      -- Same files nixos-anywhere ships via 'extras' on first install,
+      -- but on a regular re-deploy. Without these, rotating any of:
+      --   * forge_age_priv  (decryption key for sops blob)
+      --   * forge_ssh_priv  (deployer authorized pubkey)
+      --   * forge_host_priv (host's own ssh identity)
+      -- writes new values into tfstate but leaves the OLD files on
+      -- forge. The deploy "succeeds" while leaving the host
+      -- inconsistent with state — fresh ssh against the new tfstate
+      -- pinned host pub MITM-fails, fresh ssh with the new deployer
+      -- priv is rejected, and sops can't decrypt the new blob.
+      --
+      -- Order matters: place the new authorized_keys + host_key + age
+      -- key BEFORE installing the new sops blob, so when activation
+      -- runs sops-install-secrets right after deploy-rs ships the
+      -- closure, it finds matching keyfile + blob. The ssh master
+      -- warmed in phase 2 keeps existing connections alive across
+      -- the host-key replacement; new connections joining the master
+      -- via ControlPath don't re-verify, so the deploy itself isn't
+      -- disrupted. SIGHUP nudges sshd to re-read its host key file
+      -- so future fresh connections (after master timeout) see the
+      -- pinned-in-tfstate identity.
+      let scp src dst = run "scp" $ sshArgs pinned ++
+            [ src, "root@" <> ip <> ":" <> dst <> ".new" ]
+          install src mode = run "ssh" $ sshArgs pinned ++
+            [ "root@" <> ip
+            , "install -m " <> mode <> " " <> src <> ".new " <> src
+              <> " && rm -f " <> src <> ".new"
+            ]
+      scp (extras </> "etc/ssh/authorized_keys.d/root")    "/etc/ssh/authorized_keys.d/root"
+      scp (extras </> "etc/ssh/ssh_host_ed25519_key")      "/etc/ssh/ssh_host_ed25519_key"
+      scp (extras </> "etc/ssh/ssh_host_ed25519_key.pub")  "/etc/ssh/ssh_host_ed25519_key.pub"
+      scp (extras </> "var/lib/sops-nix/key.txt")          "/var/lib/sops-nix/key.txt"
+      scp blobOut                                          (hServerSecretsPath h)
+      install "/etc/ssh/authorized_keys.d/root"            "600"
+      install "/etc/ssh/ssh_host_ed25519_key"              "600"
+      install "/etc/ssh/ssh_host_ed25519_key.pub"          "644"
+      install "/var/lib/sops-nix/key.txt"                  "600"
+      install (hServerSecretsPath h)                       "600"
+      -- SIGHUP sshd so future fresh connections see the new host key.
+      -- Existing master connection is unaffected (HUP doesn't kill
+      -- existing sshd children).
+      run "ssh" $ sshArgs pinned ++
         [ "root@" <> ip
-        , "install -m 600 " <> hServerSecretsPath h <> ".new " <> hServerSecretsPath h
+        , "systemctl kill -s HUP sshd.service || pkill -HUP sshd"
         ]
     _ -> do
       IO.hPutStrLn IO.stderr ("==> " <> hName h

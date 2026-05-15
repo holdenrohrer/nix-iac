@@ -67,7 +67,7 @@
             git config user.name test
             git commit --allow-empty -q -m init
 
-            ${fixture.tofuOnlyApp.program}
+            ${fixture.tofuOnlyApp.deploy.program}
 
             test -f .tf-fixture-tofu-only/private/terraform.tfstate \
               || { echo "private tfstate missing"; exit 1; }

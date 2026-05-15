@@ -436,7 +436,7 @@ let
   # `extraSources` is for declarations that should land in tfstate but
   # aren't consumed by any host's serverSecrets or by deployEnv —
   # typically outputs published for an external flake to read.
-  mkInfraApp = { flake, hosts, tfStates, deployEnv ? {}, stateDir ? ".tf-state", extraSources ? [] }:
+  mkInfraApp = { flake, hosts, tfStates, deployEnv ? {}, stateDir ? ".tf-state", extraSources ? [], deployApp ? "infra-deploy" }:
     let
       flakeRef = "${flake}";
 
@@ -483,21 +483,51 @@ let
         nix-iac = nixIacLib;
       };
 
-      runtimeTools = [
-        pkgs.opentofu pkgs.sops pkgs.age pkgs.openssh
-        pkgs.curl pkgs.git pkgs.coreutils pkgs.gnused
+      execTools = [
+        pkgs.opentofu pkgs.sops pkgs.openssh pkgs.rsync
+        pkgs.git pkgs.coreutils
+      ];
+
+      deployTools = execTools ++ [
+        pkgs.age pkgs.curl pkgs.gnused
         nixos-anywhere.packages.${system}.default
         deploy-rs.packages.${system}.default
       ];
+
+      deployWrapped = pkgs.runCommand "infra-deploy" {
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+      } ''
+        mkdir -p $out/bin
+        makeWrapper ${consumerPkg}/bin/infra $out/bin/infra \
+          --prefix PATH : ${pkgs.lib.makeBinPath deployTools} \
+          --set LANG C.UTF-8 \
+          --set LC_ALL C.UTF-8
+      '';
 
       wrapped = pkgs.runCommand "infra" {
         nativeBuildInputs = [ pkgs.makeWrapper ];
       } ''
         mkdir -p $out/bin
-        makeWrapper ${consumerPkg}/bin/infra $out/bin/infra \
-          --prefix PATH : ${pkgs.lib.makeBinPath runtimeTools} \
+        makeWrapper ${consumerPkg}/bin/infra $out/bin/infra-real \
+          --prefix PATH : ${pkgs.lib.makeBinPath execTools} \
           --set LANG C.UTF-8 \
           --set LC_ALL C.UTF-8
+
+        cat > $out/bin/infra <<'EOF'
+        #!${pkgs.runtimeShell}
+        set -e
+        export PATH=${pkgs.lib.makeBinPath execTools}:$PATH
+        case "''${1-}" in
+          ""|deploy)
+            echo "infra: deploy uses the heavy deploy app; run ${deployApp} instead" >&2
+            exit 64
+            ;;
+          *)
+            exec "$0-real" "$@"
+            ;;
+        esac
+        EOF
+        chmod +x $out/bin/infra
       '';
     in {
       type = "app";
@@ -506,6 +536,12 @@ let
       # a Hydra job (or any other place that wants a derivation rather
       # than the `nix run` indirection).
       package = wrapped;
+      deploy = {
+        type = "app";
+        program = "${deployWrapped}/bin/infra";
+        package = deployWrapped;
+      };
+      deployPackage = deployWrapped;
     };
 
 in {

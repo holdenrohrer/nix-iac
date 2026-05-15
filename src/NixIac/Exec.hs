@@ -25,6 +25,13 @@ module NixIac.Exec
 
 import           Control.Exception        (bracket_)
 import           Control.Monad            (forM_)
+import qualified Data.Aeson               as A
+import qualified Data.Aeson.Key           as AK
+import qualified Data.Aeson.KeyMap        as AKM
+import qualified Data.ByteString.Lazy.Char8 as L8
+import qualified Data.Map.Strict          as Map
+import qualified Data.Text                as T
+import           Data.IORef               (IORef, newIORef, readIORef, modifyIORef')
 import           NixIac.Plan
 import qualified NixIac.Sops              as Sops
 import           NixIac.Run               (capture, die)
@@ -41,6 +48,11 @@ import           System.Posix.Files       (setFileMode)
 import           System.Process           (CreateProcess (..), StdStream (..),
                                             createProcess, proc, waitForProcess)
 
+data ExecCtx = ExecCtx
+  { sopsCache :: IORef (Map.Map FilePath (Map.Map String String))
+  , tofuCache :: IORef (Map.Map FilePath (Map.Map String String))
+  }
+
 -- | Resolve every host in the plan and run `cmd : args` in an environment
 -- where `ssh <host>` (etc.) Just Works. `cmd` is searched on the
 -- *non-shimmed* PATH so users can invoke any binary; openssh tools get
@@ -48,6 +60,8 @@ import           System.Process           (CreateProcess (..), StdStream (..),
 execEnv :: Plan -> [String] -> IO ()
 execEnv _    []           = die "exec: needs a command, e.g. `infra exec ssh <host> ...`"
 execEnv plan (cmd : args) = do
+  ctx <- ExecCtx <$> newIORef Map.empty <*> newIORef Map.empty
+
   -- Resolve every deployEnv binding (sops/literal/cmd, *not* tfstate) and
   -- export them, so tofu sees the same backend creds the deploy path uses.
   -- Without this, S3-backed tfstates fail to read with "no credentials
@@ -56,7 +70,7 @@ execEnv plan (cmd : args) = do
   -- you're in a chicken-and-egg with the very tofu call we're about to
   -- make.
   forM_ (planDeployEnv plan) $ \(k, src) -> do
-    v <- resolveDeployEnv k src
+    v <- resolveDeployEnv ctx k src
     setEnv k v
 
   -- Stage everything under $XDG_RUNTIME_DIR (per-user tmpfs). Falls back
@@ -68,7 +82,7 @@ execEnv plan (cmd : args) = do
     setFileMode tmp 0o700
 
     -- Resolve and write per-host material.
-    hostStanzas <- mapM (writeHostMaterial (planStateDir plan) tmp) (planHosts plan)
+    hostStanzas <- mapM (writeHostMaterial ctx (planStateDir plan) tmp) (planHosts plan)
 
     let knownHosts = tmp </> "known_hosts"
         sshConfig  = tmp </> "ssh_config"
@@ -110,12 +124,12 @@ execEnv plan (cmd : args) = do
       ExitFailure _ -> exitWith ec
 
 -- | Materialize one host's key + return (ssh_config-stanza, known_hosts-line).
-writeHostMaterial :: FilePath -> FilePath -> HostCfg
+writeHostMaterial :: ExecCtx -> FilePath -> FilePath -> HostCfg
                   -> IO (String, String)
-writeHostMaterial root tmp h = do
-  ip          <- resolveSrc root (hIp h)
-  sshPriv     <- resolveSrc root (hSshPriv h)
-  hostKeyPub  <- resolveSrc root (hHostKeyPub h)
+writeHostMaterial ctx root tmp h = do
+  ip          <- resolveSrc ctx root (hIp h)
+  sshPriv     <- resolveSrc ctx root (hSshPriv h)
+  hostKeyPub  <- resolveSrc ctx root (hHostKeyPub h)
 
   let keyPath = tmp </> (hName h <> ".key")
   writeFile keyPath (sshPriv <> "\n")
@@ -187,23 +201,66 @@ requireExe name = findExecutable name >>= \case
 -- | Resolve a Source assuming all tfstates have already applied. Mirrors
 -- Orchestrator.resolvePostApply but lives here so we don't import
 -- Orchestrator (which has heavier deps).
-resolveSrc :: FilePath -> Source -> IO String
-resolveSrc root = \case
+resolveSrc :: ExecCtx -> FilePath -> Source -> IO String
+resolveSrc ctx root = \case
   Literal v  -> pure v
   Cmd c      -> capture "sh" ["-c", c]
-  Sops f k   -> Sops.decryptKey f k
-  TfOut s k  -> capture "tofu" ["-chdir=" <> (root </> s), "output", "-raw", k]
+  Sops f k   -> cachedSopsKey ctx f k
+  TfOut s k  -> cachedTofuOutput ctx (root </> s) k
 
 -- | Resolve a Source from planDeployEnv. Refuses TfOut for the same reason
 -- as Orchestrator.resolvePreApply: tfstate-output values can't be read
 -- before tofu has the credentials we're trying to set up *here*.
-resolveDeployEnv :: String -> Source -> IO String
-resolveDeployEnv _ (Literal v)  = pure v
-resolveDeployEnv _ (Cmd c)      = capture "sh" ["-c", c]
-resolveDeployEnv _ (Sops f k)   = Sops.decryptKey f k
-resolveDeployEnv key (TfOut s _) = die
+resolveDeployEnv :: ExecCtx -> String -> Source -> IO String
+resolveDeployEnv _   _   (Literal v)  = pure v
+resolveDeployEnv _   _   (Cmd c)      = capture "sh" ["-c", c]
+resolveDeployEnv ctx _   (Sops f k)   = cachedSopsKey ctx f k
+resolveDeployEnv _   key (TfOut s _) = die
   ("exec: deployEnv binding " <> key <> " references tfstate " <> s
    <> "; only literal/cmd/sops are legal here")
+
+cachedSopsKey :: ExecCtx -> FilePath -> String -> IO String
+cachedSopsKey ctx file key = do
+  cache <- readIORef (sopsCache ctx)
+  values <- case Map.lookup file cache of
+    Just v  -> pure v
+    Nothing -> do
+      v <- Sops.decryptFile file
+      modifyIORef' (sopsCache ctx) (Map.insert file v)
+      pure v
+  case Map.lookup key values of
+    Just v  -> pure v
+    Nothing -> die ("sops: key " <> key <> " not found in " <> file)
+
+cachedTofuOutput :: ExecCtx -> FilePath -> String -> IO String
+cachedTofuOutput ctx dir key = do
+  cache <- readIORef (tofuCache ctx)
+  values <- case Map.lookup dir cache of
+    Just v  -> pure v
+    Nothing -> do
+      v <- readTofuOutputs dir
+      modifyIORef' (tofuCache ctx) (Map.insert dir v)
+      pure v
+  case Map.lookup key values of
+    Just v  -> pure v
+    Nothing -> die ("tofu output: key " <> key <> " not found in " <> dir)
+
+readTofuOutputs :: FilePath -> IO (Map.Map String String)
+readTofuOutputs dir = do
+  jsonText <- capture "tofu" ["-chdir=" <> dir, "output", "-json"]
+  case A.eitherDecode (L8.pack jsonText) of
+    Left err             -> die ("tofu output: failed to parse JSON from " <> dir <> ": " <> err)
+    Right (A.Object obj) -> pure $ Map.fromList
+      [ (AK.toString k, jsonAsString v)
+      | (k, A.Object inner) <- AKM.toList obj
+      , Just v <- [AKM.lookup (AK.fromString "value") inner]
+      ]
+    Right _              -> die ("tofu output: expected JSON object from " <> dir)
+
+jsonAsString :: A.Value -> String
+jsonAsString = \case
+  A.String t -> T.unpack t
+  other      -> L8.unpack (A.encode other)
 
 -- | Look up a bare command name against an explicit PATH string. Returns
 -- the absolute path of the first executable file found, or Nothing.

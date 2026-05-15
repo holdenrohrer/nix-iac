@@ -324,16 +324,8 @@ let
 
       tfStateCfgs = map (perStateConfig reachable) tfStates;
 
-      planFile = pkgs.writeText "infra-plan.json" (builtins.toJSON {
+      hostPlan = {
         inherit stateDir flakeRef;
-        tfStates = map (c: {
-          inherit (c) name;
-          configFile = toString c.configFile;
-          genSpecs = map (g: {
-            inherit (g) name;
-            gen = generatorJSON g.gen;
-          }) c.genSpecs;
-        }) tfStateCfgs;
         deployEnv = builtins.mapAttrs (_: sourceJSON) deployEnv;
         hosts = map (h: {
           inherit (h) name serverSecretsPath;
@@ -346,7 +338,30 @@ let
           hostKeyPub = sourceJSON h.hostKeyPub;
           serverSecrets = builtins.mapAttrs (_: sourceJSON) h.serverSecrets;
         }) hosts;
-      });
+      };
+
+      execPlanFile = pkgs.writeText "infra-exec-plan.json" (builtins.toJSON (
+        hostPlan // {
+          # `infra exec` only resolves deployEnv + host material from already
+          # applied tfstates. Keeping deploy tfstate configs out of the fast
+          # wrapper avoids evaluating unrelated deploy-only modules such as
+          # NixOS image metadata.
+          tfStates = [];
+        }
+      ));
+
+      deployPlanFile = pkgs.writeText "infra-deploy-plan.json" (builtins.toJSON (
+        hostPlan // {
+          tfStates = map (c: {
+            inherit (c) name;
+            configFile = toString c.configFile;
+            genSpecs = map (g: {
+              inherit (g) name;
+              gen = generatorJSON g.gen;
+            }) c.genSpecs;
+          }) tfStateCfgs;
+        }
+      ));
 
       execTools = [
         pkgs.opentofu pkgs.sops pkgs.openssh pkgs.rsync
@@ -364,7 +379,7 @@ let
       } ''
         mkdir -p $out/bin
         makeWrapper ${nixIacLib}/bin/nix-iac $out/bin/infra \
-          --add-flags "--plan ${planFile}" \
+          --add-flags "--plan ${deployPlanFile}" \
           --prefix PATH : ${pkgs.lib.makeBinPath deployTools} \
           --set LANG C.UTF-8 \
           --set LC_ALL C.UTF-8
@@ -375,7 +390,7 @@ let
       } ''
         mkdir -p $out/bin
         makeWrapper ${nixIacLib}/bin/nix-iac $out/bin/infra-real \
-          --add-flags "--plan ${planFile}" \
+          --add-flags "--plan ${execPlanFile}" \
           --prefix PATH : ${pkgs.lib.makeBinPath execTools} \
           --set LANG C.UTF-8 \
           --set LC_ALL C.UTF-8

@@ -35,3 +35,10 @@ library
     , NixIac.Sops
     , NixIac.SshOpts
     , NixIac.WaitSsh
+
+executable nix-iac
+  import:           opts
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  build-depends:
+      nix-iac

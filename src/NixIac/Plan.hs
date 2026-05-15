@@ -1,4 +1,6 @@
--- | The data types a per-consumer @Main.hs@ constructs and hands to
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+-- | The data types a per-consumer plan constructs and hands to
 -- 'NixIac.Orchestrator.orchestrate'.
 --
 -- The Nix DSL (@lib/iac.nix@) is the source of truth for what these mean —
@@ -11,6 +13,13 @@ module NixIac.Plan
   , Generator (..)
   , GenSpec   (..)
   ) where
+
+import qualified Data.Aeson      as A
+import           Data.Aeson      ((.:))
+import qualified Data.Aeson.Key  as AK
+import qualified Data.Aeson.KeyMap as AKM
+import           Data.Aeson.Types (Parser)
+import qualified Data.Text       as T
 
 -- | Top-level orchestration input. Built once by the generated Main.
 data Plan = Plan
@@ -88,3 +97,56 @@ data HostCfg = HostCfg
     -- per-invocation known_hosts in 'Exec'.
   , hServerSecrets     :: [(String, Source)]
   }
+
+instance A.FromJSON Plan where
+  parseJSON = A.withObject "Plan" $ \o ->
+    Plan <$> o .: "stateDir"
+         <*> o .: "flakeRef"
+         <*> o .: "tfStates"
+         <*> objectPairs o "deployEnv"
+         <*> o .: "hosts"
+
+instance A.FromJSON TfStateCfg where
+  parseJSON = A.withObject "TfStateCfg" $ \o ->
+    TfStateCfg <$> o .: "name"
+               <*> o .: "configFile"
+               <*> o .: "genSpecs"
+
+instance A.FromJSON GenSpec where
+  parseJSON = A.withObject "GenSpec" $ \o ->
+    GenSpec <$> o .: "name"
+            <*> o .: "gen"
+
+instance A.FromJSON Source where
+  parseJSON = A.withObject "Source" $ \o ->
+    (o .: "kind" :: Parser T.Text) >>= \case
+      "literal"        -> Literal <$> o .: "value"
+      "cmd"            -> Cmd     <$> o .: "command"
+      "sops"           -> Sops    <$> o .: "file" <*> o .: "key"
+      "tfstate-output" -> TfOut   <$> o .: "state" <*> o .: "outputName"
+      other            -> fail ("unknown Source kind: " <> T.unpack other)
+
+instance A.FromJSON Generator where
+  parseJSON = A.withObject "Generator" $ \o ->
+    (o .: "type" :: Parser T.Text) >>= \case
+      "once"   -> Once   <$> o .: "sensitive" <*> o .: "command"
+      "derive" -> Derive <$> o .: "sensitive" <*> o .: "from" <*> o .: "command"
+      other    -> fail ("unknown Generator type: " <> T.unpack other)
+
+instance A.FromJSON HostCfg where
+  parseJSON = A.withObject "HostCfg" $ \o ->
+    HostCfg <$> o .: "name"
+            <*> o .: "serverSecretsPath"
+            <*> o .: "ip"
+            <*> o .: "sshPriv"
+            <*> o .: "sshPub"
+            <*> o .: "agePriv"
+            <*> o .: "agePub"
+            <*> o .: "hostKeyPriv"
+            <*> o .: "hostKeyPub"
+            <*> objectPairs o "serverSecrets"
+
+objectPairs :: A.FromJSON v => A.Object -> AK.Key -> Parser [(String, v)]
+objectPairs o key = do
+  obj <- o .: key
+  pure [ (AK.toString k, v) | (k, v) <- AKM.toList obj ]
